@@ -1,0 +1,14 @@
+{
+  "name": "mts-vpbx-group-bot",
+  "version": "1.0.1",
+  "type": "module",
+  "main": "src/index.js",
+  "license": "MIT",
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "node-telegram-bot-api": "^0.66.0",
+    "puppeteer": "^22.15.0",
+    "p-retry": "^6.2.0",
+    "express": "^4.19.2"
+  }
+}
