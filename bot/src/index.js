@@ -181,12 +181,10 @@ app.post('/extension-status', async (req, res) => {
 
   const st = String(status).trim().toLowerCase(); // 'registered' | 'unavailable' | ...
   const match = resolveOrgByExtension(String(extension));
+
+  // 🚫 Если в .env нет EXTxxx_ORG → просто выходим без сообщений
   if (!match) {
-    console.warn(`⚠️ Нет EXT${extension}_ORG или ORG-конфига`);
-    if (ADMIN) {
-      await bot.sendMessage(ADMIN, `⚠️ Вебхук ext ${extension} (${status}) — нет EXT${extension}_ORG или ORG-конфига`).catch(()=>{});
-    }
-    return;
+    return; // 🚫 Просто игнорируем, ничего не пишем
   }
 
   const { orgId, chatId, org } = match;
@@ -204,7 +202,10 @@ app.post('/extension-status', async (req, res) => {
   } catch (err) {
     console.error('❌ Ошибка автопереключения:', err);
     if (ADMIN) {
-      await bot.sendMessage(ADMIN, `❌ Ошибка авто-режима ORG${orgId} (ext ${extension}, status ${status}): ${err.message}`).catch(()=>{});
+      await bot.sendMessage(
+          ADMIN,
+          `❌ Ошибка авто-режима ORG${orgId} (ext ${extension}, status ${status}): ${err.message}`
+      ).catch(()=>{});
     }
   }
 });
