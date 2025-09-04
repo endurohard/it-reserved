@@ -1,41 +1,28 @@
+// src/index.js
 import 'dotenv/config';
 import TelegramBot from 'node-telegram-bot-api';
 import { launchBrowser, snapshot } from './browser.js';
 import { MtsClient } from './mtsClient.js';
-//import PRESETS from './presets.js';
 import fs from 'fs';
 import path from 'node:path';
 import express from 'express';
 
 // ────────────────────────────────────────────────────────────
-// Веб-хук/технический эндпоинт — оставляю как у тебя
-const app = express();
-app.use(express.json());
-app.post('/extension-status', (req, res) => {
-  console.log('body', req.body);
-  res.json({ ok: true });
-});
-app.listen(4000);
+// Настройки/утилиты
 
-// ────────────────────────────────────────────────────────────
-// Загрузка организаций из .env (ORG{N}_CHAT_ID и т.д.)
+const COOLDOWN_SEC = Number(process.env.SWITCH_COOLDOWN_SEC || 60);
 
 function parseList(val) {
-  return (val || '')
-      .split(',')
-      .map(s => s.trim())
-      .filter(Boolean);
+  return (val || '').split(',').map(s => s.trim()).filter(Boolean);
 }
 
 function loadOrgsFromEnv(max = 100) {
   const byChatId = {};
   for (let i = 1; i <= max; i++) {
-    const chatId = process.env[`ORG${i}_CHAT_ID`]; // если хочешь — можно не указывать и маппить по-другому
-    const login = process.env[`ORG${i}_LOGIN`];
+    const chatId   = process.env[`ORG${i}_CHAT_ID`];
+    const login    = process.env[`ORG${i}_LOGIN`];
     const password = process.env[`ORG${i}_PASSWORD`];
     const groupUrl = process.env[`ORG${i}_GROUP_URL`];
-
-    // пропускаем пустые блоки
     if (!chatId || !login || !password || !groupUrl) continue;
 
     byChatId[String(chatId)] = {
@@ -58,13 +45,48 @@ function loadOrgsFromEnv(max = 100) {
 }
 
 const ORGS = loadOrgsFromEnv();
+const ORGS_BY_ID = Object.values(ORGS).reduce((acc, org) => {
+  acc[org.id] = org;
+  return acc;
+}, {});
+console.log('Loaded org chat IDs:', Object.keys(ORGS));
+console.log('Loaded org IDs:', Object.keys(ORGS_BY_ID));
+
+function resolveOrgByExtension(ext) {
+  const orgId = process.env[`EXT${ext}_ORG`];
+  if (!orgId) return null;
+  const org = ORGS_BY_ID[String(orgId)];
+  if (!org) return null;
+  return { orgId: Number(orgId), chatId: org.chatId, org };
+}
+
+const lastSwitch = new Map(); // {orgId: { SIP: ts, Mob: ts }}
+function canSwitch(orgId, mode) {
+  const now = Date.now();
+  if (!lastSwitch.has(orgId)) lastSwitch.set(orgId, {});
+  const bucket = lastSwitch.get(orgId);
+  const prev = bucket[mode] || 0;
+  const ok = (now - prev) / 1000 >= COOLDOWN_SEC;
+  if (ok) bucket[mode] = now;
+  return ok;
+}
 
 // ────────────────────────────────────────────────────────────
 // Telegram bot
+
 const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: true });
 const ADMIN = process.env.ADMIN_CHAT_ID ? Number(process.env.ADMIN_CHAT_ID) : null;
 
-// клавиатура для групп
+// авто-рассылка скринов администратору (если включено)
+globalThis.__sendShot = async (file, name) => {
+  try {
+    if (process.env.SEND_ALL_SHOTS === 'true' && ADMIN) {
+      await bot.sendPhoto(ADMIN, file, { caption: `[auto] ${name}` });
+    }
+  } catch {}
+};
+
+// Клавиатура и проверки доступа (одна версия!)
 const mainKeyboard = {
   reply_markup: {
     keyboard: [
@@ -76,7 +98,6 @@ const mainKeyboard = {
   },
 };
 
-// доступ: админ или настроенная орг-группа
 function onlyAdminOrGroup(msg) {
   const isAdmin = ADMIN && msg.chat.id === ADMIN;
   const isOrgChat = !!ORGS[String(msg.chat.id)];
@@ -85,7 +106,44 @@ function onlyAdminOrGroup(msg) {
   return false;
 }
 
-// специализированная обёртка под конкретную организацию (по chat.id)
+// Запуск действий для конкретной организации (без сообщения из чата)
+async function triggerModeForOrg(mode, { chatId, org }) {
+  const { login, password, group_url } = org;
+  const tag = `auto-${mode.toLowerCase()}`;
+
+  const { browser, page } = await launchBrowser();
+  const client = new MtsClient(page);
+
+  try {
+    console.log(`[AUTO] ${mode} for ORG${org.id} chat=${chatId}`);
+    await bot.sendMessage(chatId, `🔄 Auto: применяю режим ${mode}…`).catch(()=>{});
+
+    await client.login(login, password);
+    await client.openGroupUrl(group_url);
+
+    if (mode === 'SIP') {
+      await client.applyFlow(org.sip.remove, org.sip.add);
+    } else {
+      await client.applyFlow(org.mob.remove, org.mob.add);
+    }
+
+    await bot.sendMessage(chatId, `✅ ${mode} применён`).catch(()=>{});
+    if (ADMIN && Number(chatId) !== ADMIN) {
+      await bot.sendMessage(ADMIN, `✅ ${mode} применён для ORG${org.id} (${chatId})`).catch(()=>{});
+    }
+  } catch (e) {
+    const file = await snapshot(page, `${tag}-error`);
+    if (ADMIN) {
+      await bot.sendMessage(ADMIN, `❌ Ошибка ${mode} для ORG${org.id}: ${e.message}`).catch(()=>{});
+      if (file) await bot.sendPhoto(ADMIN, file, { caption: `${mode} ORG${org.id}` }).catch(()=>{});
+    }
+    throw e;
+  } finally {
+    await browser.close();
+  }
+}
+
+// Обёртка по chat.id (для кнопок/команд из групп)
 async function withClientForOrg(msg, fn, { tag = 'op' } = {}) {
   const org = ORGS[String(msg.chat.id)];
   if (!org) throw new Error('Эта группа не настроена в .env (ORG{N}_...)');
@@ -99,7 +157,7 @@ async function withClientForOrg(msg, fn, { tag = 'op' } = {}) {
   } catch (e) {
     try {
       const file = await snapshot(page, `error-${tag}`);
-      await bot.sendPhoto(msg.chat.id, file, { caption: `❌ Ошибка (${tag}): ${e.message}` });
+      await bot.sendPhoto(ADMIN || msg.chat.id, file, { caption: `❌ Ошибка (${tag}): ${e.message}` });
     } catch {}
     throw e;
   } finally {
@@ -107,41 +165,54 @@ async function withClientForOrg(msg, fn, { tag = 'op' } = {}) {
   }
 }
 
-// старая админская обёртка — оставляю для /set, /clear и т.п.
-async function withClient(fn, { tag = 'op' } = {}) {
-  const { browser, page } = await launchBrowser();
-  const client = new MtsClient(page);
-  try {
-    await client.login(process.env.MTS_LOGIN, process.env.MTS_PASSWORD);
+// ────────────────────────────────────────────────────────────
+// HTTP Webhook (единственный маршрут)
 
-    if (process.env.GROUP_URL && process.env.GROUP_URL.trim()) {
-      await client.openGroupUrl(process.env.GROUP_URL);
-    } else {
-      await client.openRingGroups();
-      await client.clickByText('a, span, div, li', 'Группы', { optional: true });
-      if (process.env.GROUP_NAME) {
-        await client.openGroupByName(process.env.GROUP_NAME);
-      }
-    }
+const app = express();
+app.use(express.json());
 
-    return await fn(client);
-  } catch (e) {
-    try {
-      const file = await snapshot(page, `error-${tag}`);
-      if (file && ADMIN) {
-        await bot.sendPhoto(ADMIN, file, { caption: `❌ Ошибка (${tag}): ${e.message}` });
-      }
-    } catch (snapErr) {
-      console.error('Ошибка при отправке скрина в Telegram:', snapErr.message);
+app.post('/extension-status', async (req, res) => {
+  res.json({ ok: true });
+
+  const { event, extension, status } = req.body || {};
+  console.log('📩 Webhook body:', req.body);
+
+  if ((event && event !== 'ExtensionStatus') || !extension || !status) return;
+
+  const st = String(status).trim().toLowerCase(); // 'registered' | 'unavailable' | ...
+  const match = resolveOrgByExtension(String(extension));
+  if (!match) {
+    console.warn(`⚠️ Нет EXT${extension}_ORG или ORG-конфига`);
+    if (ADMIN) {
+      await bot.sendMessage(ADMIN, `⚠️ Вебхук ext ${extension} (${status}) — нет EXT${extension}_ORG или ORG-конфига`).catch(()=>{});
     }
-    throw e;
-  } finally {
-    await browser.close();
+    return;
   }
-}
+
+  const { orgId, chatId, org } = match;
+
+  try {
+    if (st === 'registered') {
+      if (!canSwitch(orgId, 'SIP')) return console.log(`⏱️ Cooldown SIP ORG${orgId}`);
+      await triggerModeForOrg('SIP', { chatId, org });
+    } else if (st === 'unavailable' || st === 'unregistered' || st === 'not registered') {
+      if (!canSwitch(orgId, 'Mob')) return console.log(`⏱️ Cooldown Mob ORG${orgId}`);
+      await triggerModeForOrg('Mob', { chatId, org });
+    } else {
+      console.log(`ℹ️ Статус ${status} для ext ${extension} — действие не требуется`);
+    }
+  } catch (err) {
+    console.error('❌ Ошибка автопереключения:', err);
+    if (ADMIN) {
+      await bot.sendMessage(ADMIN, `❌ Ошибка авто-режима ORG${orgId} (ext ${extension}, status ${status}): ${err.message}`).catch(()=>{});
+    }
+  }
+});
+
+app.listen(4000, () => console.log('Webhook listening on port 4000'));
 
 // ────────────────────────────────────────────────────────────
-// Команды для орг-групп: SIP и Mob (кнопки и /команды)
+// Команды/кнопки для групп
 
 async function handleSip(msg) {
   if (!onlyAdminOrGroup(msg)) return;
@@ -169,35 +240,14 @@ async function handleMob(msg) {
   }
 }
 
-// кнопки
 bot.onText(/^SIP$/, handleSip);
 bot.onText(/^Mob$/i, handleMob);
-
-// слэш-команды (на случай, если кнопки скрыли)
 bot.onText(/\/sip\b/i, handleSip);
 bot.onText(/\/mob\b/i, handleMob);
 
-// старт — показать клавиатуру
 bot.onText(/\/start/, (msg) => {
   if (!onlyAdminOrGroup(msg)) return;
   bot.sendMessage(msg.chat.id, 'Выберите режим или используйте команды:', mainKeyboard);
-});
-
-// ────────────────────────────────────────────────────────────
-// Админские/общие команды (оставлены как были)
-
-bot.onText(/\/help/, (msg) => {
-  if (!onlyAdminOrGroup(msg)) return;
-  bot.sendMessage(msg.chat.id, `Команды:
-/sip — режим SIP (для текущей группы)
-/mob — режим Mob (reserved) (для текущей группы)
-/status — показать состав группы (для текущей группы)
-/screens [N] — последние N скриншотов (по-умолчанию 5)
-
-Админ (личка):
-/set preset <day|night|full|reserve>
-/set members <имя;имя;...>
-/clear`);
 });
 
 bot.onText(/\/status/, async (msg) => {
@@ -225,9 +275,7 @@ bot.onText(/\/screens(?:\s+(\d+))?/, async (msg, m) => {
         .sort()
         .slice(-limit);
 
-    if (files.length === 0) {
-      return bot.sendMessage(msg.chat.id, 'Скриншотов пока нет.');
-    }
+    if (!files.length) return bot.sendMessage(msg.chat.id, 'Скриншотов пока нет.');
     for (const f of files) {
       await bot.sendPhoto(msg.chat.id, path.join(dir, f), { caption: f });
     }
@@ -236,57 +284,8 @@ bot.onText(/\/screens(?:\s+(\d+))?/, async (msg, m) => {
   }
 });
 
-// ——— Ниже команды, оставшиеся для админа (опционально)
-function onlyAdmin(msg) {
-  if (ADMIN && msg.chat.id === ADMIN) return true;
-  bot.sendMessage(msg.chat.id, '⛔️ Нет доступа (только для ADMIN_CHAT_ID)');
-  return false;
-}
-
-bot.onText(/\/set\s+preset\s+(\w+)/, async (msg, match) => {
-  if (!onlyAdmin(msg)) return;
-  const name = (match?.[1] || '').toLowerCase();
-  const list = PRESETS[name];
-  if (!list) return bot.sendMessage(msg.chat.id, 'Нет такого пресета');
-  await bot.sendMessage(msg.chat.id, `Применяю пресет: ${name}\n${list.join(', ')}`);
-  try {
-    await withClient(async (c) => c.setMembers(list), { tag: `preset-${name}` });
-    await bot.sendMessage(msg.chat.id, 'Готово ✅');
-  } catch (e) {
-    await bot.sendMessage(msg.chat.id, 'Ошибка: ' + e.message);
-  }
-});
-
 bot.onText(/\/id/, (msg) => {
   bot.sendMessage(msg.chat.id, `chat.id: ${msg.chat.id}\nchat.title: ${msg.chat.title || '(нет)'}`);
 });
 
-bot.onText(/\/set\s+members\s+(.+)/, async (msg, match) => {
-  if (!onlyAdmin(msg)) return;
-  const raw = match?.[1] || '';
-  const list = raw.split(';').map(s => s.trim()).filter(Boolean);
-  if (!list.length) return bot.sendMessage(msg.chat.id, 'Список пуст');
-  await bot.sendMessage(msg.chat.id, 'Применяю состав...');
-  try {
-    await withClient(async (c) => {
-      if (process.env.GROUP_URL) await c.openGroupUrl(process.env.GROUP_URL);
-      await c.applyReserveFlow();
-    }, { tag: 'reserve' });
-    await bot.sendMessage(msg.chat.id, 'Готово ✅');
-  } catch (e) {
-    await bot.sendMessage(msg.chat.id, 'Ошибка: ' + e.message);
-  }
-});
-
-bot.onText(/\/clear/, async (msg) => {
-  if (!onlyAdmin(msg)) return;
-  try {
-    await withClient(async (c) => c.setMembers([]), { tag: 'clear' });
-    await bot.sendMessage(msg.chat.id, 'Группа очищена ✅');
-  } catch (e) {
-    await bot.sendMessage(msg.chat.id, 'Ошибка: ' + e.message);
-  }
-});
-
 console.log('Bot started');
-console.log('Loaded org chat IDs:', Object.keys(ORGS));
