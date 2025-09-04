@@ -175,6 +175,9 @@ app.post('/extension-status', async (req, res) => {
   res.json({ ok: true });
 
   const { event, extension, status } = req.body || {};
+  const rawOrgId = process.env[`EXT${extension}_ORG`];
+  console.log(`[DEBUG] EXT${extension}_ORG=`, rawOrgId);
+  console.log('[DEBUG] ORGS_BY_ID keys:', Object.keys(ORGS_BY_ID));
   console.log('📩 Webhook body:', req.body);
 
   if ((event && event !== 'ExtensionStatus') || !extension || !status) return;
@@ -184,7 +187,8 @@ app.post('/extension-status', async (req, res) => {
 
   // 🚫 Если в .env нет EXTxxx_ORG → просто выходим без сообщений
   if (!match) {
-    return; // 🚫 Просто игнорируем, ничего не пишем
+    console.log(`[DEBUG] No match for extension ${extension}. rawOrgId=${rawOrgId}`);
+    return;
   }
 
   const { orgId, chatId, org } = match;
