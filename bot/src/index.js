@@ -60,6 +60,19 @@ function resolveOrgByExtension(ext) {
   return { orgId: Number(orgId), chatId: org.chatId, org };
 }
 
+// Проверка: активен ли уже нужный режим по префиксам
+function isModeActiveOnMembers(org, members, mode) {
+  const set = mode === 'SIP' ? org.sip : org.mob;
+  const hasPrefix = (pref) => members.some(m => m.trim().startsWith(pref + ' '));
+
+  // все что "должны быть" — присутствуют
+  const allAddPresent = (set.add || []).every(hasPrefix);
+  // все что "должны быть удалены" — отсутствуют
+  const allRemoveAbsent = (set.remove || []).every(pref => !hasPrefix(pref));
+
+  return allAddPresent && allRemoveAbsent;
+}
+
 const lastSwitch = new Map(); // {orgId: { SIP: ts, Mob: ts }}
 function canSwitch(orgId, mode) {
   const now = Date.now();
@@ -116,10 +129,22 @@ async function triggerModeForOrg(mode, { chatId, org }) {
 
   try {
     console.log(`[AUTO] ${mode} for ORG${org.id} chat=${chatId}`);
-    await bot.sendMessage(chatId, `🔄 Auto: применяю режим ${mode}…`).catch(()=>{});
 
     await client.login(login, password);
     await client.openGroupUrl(group_url);
+
+    // 👉 сначала читаем текущих участников
+    const data = await client.getMembers();
+    const members = data?.members || [];
+
+    // 👉 если уже нужный режим — выходим без сообщений в чат
+    if (isModeActiveOnMembers(org, members, mode)) {
+      console.log(`[AUTO] ORG${org.id}: режим ${mode} уже активен — пропускаю`);
+      return;
+    }
+
+    // только если реально нужен переключатель — сообщаем и применяем
+    await bot.sendMessage(chatId, `🔄 Auto: применяю режим ${mode}…`).catch(()=>{});
 
     if (mode === 'SIP') {
       await client.applyFlow(org.sip.remove, org.sip.add);
