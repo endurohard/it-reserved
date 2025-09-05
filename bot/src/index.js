@@ -60,31 +60,79 @@ function resolveOrgByExtension(ext) {
   return { orgId: Number(orgId), chatId: org.chatId, org };
 }
 
-// Проверка: активен ли уже нужный режим по префиксам
+// ────────────────────────────────────────────────────────────
+// STATE: хранение последнего статуса экстеншенов
+
+const STATE_PATH = '/app/data/last-ext-status.json';
+let state = { ext: {} }; // { "<ext>": { status: "registered|unavailable|...", ts: 123 } }
+
+try {
+  const raw = fs.existsSync(STATE_PATH) ? await fs.promises.readFile(STATE_PATH, 'utf8') : '{}';
+  const parsed = JSON.parse(raw || '{}');
+  if (parsed && typeof parsed === 'object' && parsed.ext) state = parsed;
+  console.log('[STATE] loaded:', Object.keys(state.ext));
+} catch (e) {
+  console.warn('[STATE] load error:', e.message);
+}
+
+let saveTimer = null;
+function saveStateDebounced() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(async () => {
+    try {
+      await fs.promises.mkdir(path.dirname(STATE_PATH), { recursive: true });
+      await fs.promises.writeFile(STATE_PATH, JSON.stringify(state, null, 2));
+      console.log('[STATE] saved');
+    } catch (e) {
+      console.warn('[STATE] save error:', e.message);
+    }
+  }, 200);
+}
+
+// список допустимых экстеншенов из .env (только EXT{ext}_ORG)
+const ALLOWED_EXT = new Set(
+    Object.keys(process.env)
+        .map(k => k.match(/^EXT(\d+)_ORG$/))
+        .filter(Boolean)
+        .map(m => m[1])
+);
+console.log('[STATE] allowed EXT:', [...ALLOWED_EXT]);
+
+function normStatus(s) {
+  const v = String(s || '').trim().toLowerCase();
+  if (v === 'registered') return 'registered';
+  if (v === 'unavailable' || v === 'unregistered' || v === 'not registered') return 'unavailable';
+  return v; // ringing, busy, etc.
+}
+function desiredModeByStatus(st) {
+  if (st === 'registered') return 'SIP';
+  if (st === 'unavailable') return 'Mob';
+  return null;
+}
+
+// ────────────────────────────────────────────────────────────
+// Проверка: активен ли уже нужный режим по наборам экстеншенов
+
 function isModeActiveOnMembers(org, members, mode) {
   const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
-
-  // извлекаем первую трёхзначную группу цифр из строки
   const extractExt = (s) => {
-    const m = norm(s).match(/\b(\d{3})\b/);
+    const m = norm(s).match(/\b(\d{3})\b/); // берём первую "###"
     return m ? m[1] : null;
   };
 
-  // множество экстеншнов, реально присутствующих справа (members)
-  const present = new Set((members || []).map(extractExt).filter(Boolean));
+  // фактически присутствующие экстеншены справа (members)
+  const present = new Set(
+      (members || []).map(extractExt).filter(Boolean)
+  );
 
   const plan = mode === 'SIP' ? org.sip : org.mob;
-  const adds    = (plan.add    || []).map(String);
+  const adds = (plan.add || []).map(String);
   const removes = (plan.remove || []).map(String);
 
-  const allAddPresent   = adds.every(p => present.has(p));
+  const allAddPresent = adds.every(p => present.has(p));
   const allRemoveAbsent = removes.every(p => !present.has(p));
 
-  console.log(
-      `[CHK] mode=${mode} present=${JSON.stringify([...present])} ` +
-      `needAdd=${JSON.stringify(adds)} needRm=${JSON.stringify(removes)} ` +
-      `-> addOK=${allAddPresent} rmOK=${allRemoveAbsent}`
-  );
+  console.log(`[CHK] mode=${mode} present=${JSON.stringify([...present])} needAdd=${JSON.stringify(adds)} needRm=${JSON.stringify(removes)} -> addOK=${allAddPresent} rmOK=${allRemoveAbsent}`);
 
   return allAddPresent && allRemoveAbsent;
 }
@@ -115,7 +163,7 @@ globalThis.__sendShot = async (file, name) => {
   } catch {}
 };
 
-// Клавиатура и проверки доступа (одна версия!)
+// Клавиатура и проверки доступа
 const mainKeyboard = {
   reply_markup: {
     keyboard: [
@@ -135,7 +183,9 @@ function onlyAdminOrGroup(msg) {
   return false;
 }
 
-// Запуск действий для конкретной организации (без сообщения из чата)
+// ────────────────────────────────────────────────────────────
+// Выполнение режима для конкретной организации
+
 async function triggerModeForOrg(mode, { chatId, org }) {
   const { login, password, group_url } = org;
   const tag = `auto-${mode.toLowerCase()}`;
@@ -144,30 +194,32 @@ async function triggerModeForOrg(mode, { chatId, org }) {
   const client = new MtsClient(page);
 
   try {
-    console.log(`[AUTO] ${mode} for ORG${org.id} chat=${chatId}`);
-
+    // 1) Логин/открытие группы
     await client.login(login, password);
     await client.openGroupUrl(group_url);
 
-    // 👉 сначала читаем текущих участников
+    // 2) Чтение текущего состава
     const data = await client.getMembers();
     const members = data?.members || [];
 
-    // 👉 если уже нужный режим — выходим без сообщений в чат
+    // 3) Проверка — если режим уже активен, тихо выходим
     if (isModeActiveOnMembers(org, members, mode)) {
       console.log(`[AUTO] ORG${org.id}: режим ${mode} уже активен — пропускаю`);
       return;
     }
 
-    // только если реально нужен переключатель — сообщаем и применяем
+    // 4) Только теперь логируем и шлём сообщение в чат
+    console.log(`[AUTO] APPLY ${mode} for ORG${org.id} chat=${chatId}`);
     await bot.sendMessage(chatId, `🔄 Auto: применяю режим ${mode}…`).catch(()=>{});
 
+    // 5) Применяем
     if (mode === 'SIP') {
       await client.applyFlow(org.sip.remove, org.sip.add);
     } else {
       await client.applyFlow(org.mob.remove, org.mob.add);
     }
 
+    // 6) Отчёт
     await bot.sendMessage(chatId, `✅ ${mode} применён`).catch(()=>{});
     if (ADMIN && Number(chatId) !== ADMIN) {
       await bot.sendMessage(ADMIN, `✅ ${mode} применён для ORG${org.id} (${chatId})`).catch(()=>{});
@@ -184,28 +236,6 @@ async function triggerModeForOrg(mode, { chatId, org }) {
   }
 }
 
-// Обёртка по chat.id (для кнопок/команд из групп)
-async function withClientForOrg(msg, fn, { tag = 'op' } = {}) {
-  const org = ORGS[String(msg.chat.id)];
-  if (!org) throw new Error('Эта группа не настроена в .env (ORG{N}_...)');
-
-  const { browser, page } = await launchBrowser();
-  const client = new MtsClient(page);
-  try {
-    await client.login(org.login, org.password);
-    await client.openGroupUrl(org.group_url);
-    return await fn(client, org);
-  } catch (e) {
-    try {
-      const file = await snapshot(page, `error-${tag}`);
-      await bot.sendPhoto(ADMIN || msg.chat.id, file, { caption: `❌ Ошибка (${tag}): ${e.message}` });
-    } catch {}
-    throw e;
-  } finally {
-    await browser.close();
-  }
-}
-
 // ────────────────────────────────────────────────────────────
 // HTTP Webhook (единственный маршрут)
 
@@ -216,40 +246,56 @@ app.post('/extension-status', async (req, res) => {
   res.json({ ok: true });
 
   const { event, extension, status } = req.body || {};
-  const rawOrgId = process.env[`EXT${extension}_ORG`];
-  console.log(`[DEBUG] EXT${extension}_ORG=`, rawOrgId);
-  console.log('[DEBUG] ORGS_BY_ID keys:', Object.keys(ORGS_BY_ID));
+  const ext = String(extension || '').trim();
+  const st  = normStatus(status);
   console.log('📩 Webhook body:', req.body);
 
-  if ((event && event !== 'ExtensionStatus') || !extension || !status) return;
+  if ((event && event !== 'ExtensionStatus') || !ext || !st) return;
 
-  const st = String(status).trim().toLowerCase(); // 'registered' | 'unavailable' | ...
-  const match = resolveOrgByExtension(String(extension));
-
-  // 🚫 Если в .env нет EXTxxx_ORG → просто выходим без сообщений
-  if (!match) {
-    console.log(`[DEBUG] No match for extension ${extension}. rawOrgId=${rawOrgId}`);
+  // игнорируем номера, которых нет в .env
+  if (!ALLOWED_EXT.has(ext)) {
+    console.log(`[DEBUG] skip ext ${ext}: not in .env EXT{ext}_ORG`);
     return;
   }
 
+  // находим org / чат
+  const match = resolveOrgByExtension(ext);
+  if (!match) {
+    console.log(`[DEBUG] No match for extension ${ext}.`);
+    return;
+  }
   const { orgId, chatId, org } = match;
 
+  // сравнение с предыдущим статусом
+  const prev = state.ext[ext]?.status || null;
+  if (prev === st) {
+    console.log(`[STATE] ext ${ext}: status "${st}" not changed — skip`);
+    return;
+  }
+
+  // сохраняем новый статус
+  state.ext[ext] = { status: st, ts: Date.now() };
+  saveStateDebounced();
+
+  // определяем целевой режим
+  const mode = desiredModeByStatus(st);
+  if (!mode) {
+    console.log(`ℹ️ ext ${ext}: status "${st}" — действий нет`);
+    return;
+  }
+
   try {
-    if (st === 'registered') {
-      if (!canSwitch(orgId, 'SIP')) return console.log(`⏱️ Cooldown SIP ORG${orgId}`);
-      await triggerModeForOrg('SIP', { chatId, org });
-    } else if (st === 'unavailable' || st === 'unregistered' || st === 'not registered') {
-      if (!canSwitch(orgId, 'Mob')) return console.log(`⏱️ Cooldown Mob ORG${orgId}`);
-      await triggerModeForOrg('Mob', { chatId, org });
-    } else {
-      console.log(`ℹ️ Статус ${status} для ext ${extension} — действие не требуется`);
+    if (!canSwitch(orgId, mode)) {
+      console.log(`⏱️ Cooldown ${mode} ORG${orgId}`);
+      return;
     }
+    await triggerModeForOrg(mode, { chatId, org });
   } catch (err) {
     console.error('❌ Ошибка автопереключения:', err);
     if (ADMIN) {
       await bot.sendMessage(
           ADMIN,
-          `❌ Ошибка авто-режима ORG${orgId} (ext ${extension}, status ${status}): ${err.message}`
+          `❌ Ошибка авто-режима ORG${orgId} (ext ${ext}, status ${status}): ${err.message}`
       ).catch(()=>{});
     }
   }
@@ -258,7 +304,7 @@ app.post('/extension-status', async (req, res) => {
 app.listen(4000, () => console.log('Webhook listening on port 4000'));
 
 // ────────────────────────────────────────────────────────────
-// Команды/кнопки для групп
+/** Команды/кнопки для групп */
 
 async function handleSip(msg) {
   if (!onlyAdminOrGroup(msg)) return;
@@ -332,6 +378,14 @@ bot.onText(/\/screens(?:\s+(\d+))?/, async (msg, m) => {
 
 bot.onText(/\/id/, (msg) => {
   bot.sendMessage(msg.chat.id, `chat.id: ${msg.chat.id}\nchat.title: ${msg.chat.title || '(нет)'}`);
+});
+
+// админская диагностика состояния
+bot.onText(/\/state(?:\s+(\d+))?/, (msg) => {
+  if (!ADMIN || msg.chat.id !== ADMIN) return;
+  const lines = Object.entries(state.ext)
+      .map(([k, v]) => `${k}: ${v.status} @ ${new Date(v.ts).toLocaleString()}`);
+  bot.sendMessage(msg.chat.id, lines.length ? lines.join('\n') : 'пусто');
 });
 
 console.log('Bot started');
