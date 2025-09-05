@@ -62,13 +62,29 @@ function resolveOrgByExtension(ext) {
 
 // Проверка: активен ли уже нужный режим по префиксам
 function isModeActiveOnMembers(org, members, mode) {
-  const set = mode === 'SIP' ? org.sip : org.mob;
-  const hasPrefix = (pref) => members.some(m => m.trim().startsWith(pref + ' '));
+  const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
 
-  // все что "должны быть" — присутствуют
-  const allAddPresent = (set.add || []).every(hasPrefix);
-  // все что "должны быть удалены" — отсутствуют
-  const allRemoveAbsent = (set.remove || []).every(pref => !hasPrefix(pref));
+  // извлекаем первую трёхзначную группу цифр из строки
+  const extractExt = (s) => {
+    const m = norm(s).match(/\b(\d{3})\b/);
+    return m ? m[1] : null;
+  };
+
+  // множество экстеншнов, реально присутствующих справа (members)
+  const present = new Set((members || []).map(extractExt).filter(Boolean));
+
+  const plan = mode === 'SIP' ? org.sip : org.mob;
+  const adds    = (plan.add    || []).map(String);
+  const removes = (plan.remove || []).map(String);
+
+  const allAddPresent   = adds.every(p => present.has(p));
+  const allRemoveAbsent = removes.every(p => !present.has(p));
+
+  console.log(
+      `[CHK] mode=${mode} present=${JSON.stringify([...present])} ` +
+      `needAdd=${JSON.stringify(adds)} needRm=${JSON.stringify(removes)} ` +
+      `-> addOK=${allAddPresent} rmOK=${allRemoveAbsent}`
+  );
 
   return allAddPresent && allRemoveAbsent;
 }
