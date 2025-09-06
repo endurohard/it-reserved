@@ -11,6 +11,7 @@ import express from 'express';
 // Настройки/утилиты
 
 const COOLDOWN_SEC = Number(process.env.SWITCH_COOLDOWN_SEC || 60);
+const GRACE_SEC    = Number(process.env.UNAVAILABLE_GRACE_SEC || 60); // ожидание после Unavailable
 
 function parseList(val) {
   return (val || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -98,16 +99,30 @@ const ALLOWED_EXT = new Set(
 );
 console.log('[STATE] allowed EXT:', [...ALLOWED_EXT]);
 
+// Карта orgId -> Set(ext) из .env
+const ORG_EXTS = new Map();
+for (const [k, v] of Object.entries(process.env)) {
+  const m = k.match(/^EXT(\d+)_ORG$/);
+  if (!m) continue;
+  const ext = m[1];
+  const orgId = String(v);
+  if (!ORG_EXTS.has(orgId)) ORG_EXTS.set(orgId, new Set());
+  ORG_EXTS.get(orgId).add(ext);
+}
+function anyExtRegisteredInOrg(orgId) {
+  const set = ORG_EXTS.get(String(orgId));
+  if (!set || !set.size) return false;
+  for (const ext of set) {
+    if (state.ext[ext]?.status === 'registered') return true;
+  }
+  return false;
+}
+
 function normStatus(s) {
   const v = String(s || '').trim().toLowerCase();
   if (v === 'registered') return 'registered';
   if (v === 'unavailable' || v === 'unregistered' || v === 'not registered') return 'unavailable';
   return v; // ringing, busy, etc.
-}
-function desiredModeByStatus(st) {
-  if (st === 'registered') return 'SIP';
-  if (st === 'unavailable') return 'Mob';
-  return null;
 }
 
 // ────────────────────────────────────────────────────────────
@@ -146,6 +161,44 @@ function canSwitch(orgId, mode) {
   const ok = (now - prev) / 1000 >= COOLDOWN_SEC;
   if (ok) bucket[mode] = now;
   return ok;
+}
+
+// ────────────────────────────────────────────────────────────
+// Таймеры "отложить Mob"
+
+const PENDING_MOB = new Map(); // orgId -> { t: Timeout, untilTs: number }
+
+function cancelMobTimer(orgId, reason = '') {
+  const p = PENDING_MOB.get(orgId);
+  if (p?.t) clearTimeout(p.t);
+  if (p) console.log(`[TIMER] ORG${orgId}: canceled${reason ? ' — ' + reason : ''}`);
+  PENDING_MOB.delete(orgId);
+}
+
+function scheduleMobTimer({ orgId, chatId, org }) {
+  cancelMobTimer(orgId);
+  const until = Date.now() + GRACE_SEC * 1000;
+
+  const t = setTimeout(async () => {
+    try {
+      if (anyExtRegisteredInOrg(orgId)) {
+        console.log(`[TIMER] ORG${orgId}: есть registered — Mob не делаю`);
+        return;
+      }
+      if (!canSwitch(orgId, 'Mob')) {
+        console.log(`[TIMER] ORG${orgId}: cooldown — Mob не делаю`);
+        return;
+      }
+      await triggerModeForOrg('Mob', { chatId, org });
+    } catch (e) {
+      console.error(`[TIMER] ORG${orgId}: ошибка Mob по таймеру:`, e.message);
+    } finally {
+      PENDING_MOB.delete(orgId);
+    }
+  }, GRACE_SEC * 1000);
+
+  PENDING_MOB.set(orgId, { t, untilTs: until });
+  console.log(`[TIMER] ORG${orgId}: scheduled Mob in ${GRACE_SEC}s (until ${new Date(until).toISOString()})`);
 }
 
 // ────────────────────────────────────────────────────────────
@@ -236,6 +289,28 @@ async function triggerModeForOrg(mode, { chatId, org }) {
   }
 }
 
+// Обёртка по chat.id (для кнопок/команд из групп)
+async function withClientForOrg(msg, fn, { tag = 'op' } = {}) {
+  const org = ORGS[String(msg.chat.id)];
+  if (!org) throw new Error('Эта группа не настроена в .env (ORG{N}_...)');
+
+  const { browser, page } = await launchBrowser();
+  const client = new MtsClient(page);
+  try {
+    await client.login(org.login, org.password);
+    await client.openGroupUrl(org.group_url);
+    return await fn(client, org);
+  } catch (e) {
+    try {
+      const file = await snapshot(page, `error-${tag}`);
+      await bot.sendPhoto(ADMIN || msg.chat.id, file, { caption: `❌ Ошибка (${tag}): ${e.message}` });
+    } catch {}
+    throw e;
+  } finally {
+    await browser.close();
+  }
+}
+
 // ────────────────────────────────────────────────────────────
 // HTTP Webhook (единственный маршрут)
 
@@ -277,19 +352,34 @@ app.post('/extension-status', async (req, res) => {
   state.ext[ext] = { status: st, ts: Date.now() };
   saveStateDebounced();
 
-  // определяем целевой режим
-  const mode = desiredModeByStatus(st);
-  if (!mode) {
-    console.log(`ℹ️ ext ${ext}: status "${st}" — действий нет`);
-    return;
-  }
-
+  // обработка статусов с таймерной логикой
   try {
-    if (!canSwitch(orgId, mode)) {
-      console.log(`⏱️ Cooldown ${mode} ORG${orgId}`);
+    if (st === 'registered') {
+      // Любая регистрация по EXT этой ORG отменяет отложенный Mob
+      cancelMobTimer(orgId, 'registered received');
+
+      // Можно вернуть SIP, но только если реально требуется (и без спама)
+      if (!canSwitch(orgId, 'SIP')) {
+        console.log(`⏱️ Cooldown SIP ORG${orgId}`);
+        return;
+      }
+      await triggerModeForOrg('SIP', { chatId, org });
       return;
     }
-    await triggerModeForOrg(mode, { chatId, org });
+
+    if (st === 'unavailable') {
+      // Если хотя бы один ext зарегистрирован — вообще не ставим таймер
+      if (anyExtRegisteredInOrg(orgId)) {
+        console.log(`[AUTO] ORG${orgId}: минимум один ext registered — таймер Mob не ставлю`);
+        return;
+      }
+      // Ставим/перезапускаем таймер — через GRACE_SEC сделаем Mob, если никто не "поднимется"
+      scheduleMobTimer({ orgId, chatId, org });
+      return;
+    }
+
+    // Для прочих статусов (ringing, busy…) действий не требуется
+    console.log(`ℹ️ ext ${ext}: status "${st}" — действий нет`);
   } catch (err) {
     console.error('❌ Ошибка автопереключения:', err);
     if (ADMIN) {
@@ -386,6 +476,15 @@ bot.onText(/\/state(?:\s+(\d+))?/, (msg) => {
   const lines = Object.entries(state.ext)
       .map(([k, v]) => `${k}: ${v.status} @ ${new Date(v.ts).toLocaleString()}`);
   bot.sendMessage(msg.chat.id, lines.length ? lines.join('\n') : 'пусто');
+});
+
+// админ: просмотр таймеров
+bot.onText(/\/timers/, (msg) => {
+  if (!ADMIN || msg.chat.id !== ADMIN) return;
+  const rows = [...PENDING_MOB.entries()].map(([orgId, v]) =>
+      `ORG${orgId} → до ${new Date(v.untilTs).toLocaleString()}`
+  );
+  bot.sendMessage(msg.chat.id, rows.length ? rows.join('\n') : 'Таймеров нет');
 });
 
 console.log('Bot started');
