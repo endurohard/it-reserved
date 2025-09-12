@@ -395,6 +395,13 @@ app.post('/extension-status', async (req, res) => {
     return;
   }
 
+  // интересуют только два статуса
+  const INTERESTING = new Set(['registered', 'unavailable']);
+  if (!INTERESTING.has(st)) {
+    console.log(`ℹ️ ext ${ext}: status "${st}" — игнорируем (БД/лог без изменений)`);
+    return;
+  }
+
   const match = resolveOrgByExtension(ext);
   if (!match) {
     console.log(`[DEBUG] No match for extension ${ext}.`);
@@ -402,28 +409,26 @@ app.post('/extension-status', async (req, res) => {
   }
   const { orgId, chatId, org } = match;
 
-  // сравнение с предыдущим статусом (in-memory JSON)
+  // прошлый ЗНАЧИМЫЙ статус из памяти
   const prev = state.ext[ext]?.status || null;
   if (prev === st) {
-    console.log(`[STATE] ext ${ext}: status "${st}" not changed — skip`);
-    // даже если не менялось — обновим БД ts для мониторинга "последнего пинга"
-    const tsNow = Date.now();
-    stmtUpsertExt.run({ ext, org_id: orgId, status: st, ts: tsNow });
+    console.log(`[STATE] ext ${ext}: status "${st}" not changed — skip (БД/лог не трогаем)`);
     return;
   }
 
-  // сохраняем новый статус
+  // сохраняем новый ЗНАЧИМЫЙ статус (только registered/unavailable)
   const ts = Date.now();
   state.ext[ext] = { status: st, ts };
   saveStateDebounced();
 
-  // и в БД + лог
+  // БД + лог — только для двух статусов
   stmtUpsertExt.run({ ext, org_id: orgId, status: st, ts });
   stmtInsertLog.run({ ext, org_id: orgId, status: st, ts });
 
   // обработка статусов с таймерной логикой
   try {
     if (st === 'registered') {
+      // Любая регистрация отменяет отложенный Mob и тащит SIP
       cancelMobTimer(orgId, 'registered received');
       if (!canSwitch(orgId, 'SIP')) {
         console.log(`⏱️ Cooldown SIP ORG${orgId}`);
@@ -439,17 +444,14 @@ app.post('/extension-status', async (req, res) => {
         return;
       }
       scheduleMobTimer({ orgId, chatId, org });
-      return;
     }
-
-    console.log(`ℹ️ ext ${ext}: status "${st}" — действий нет`);
   } catch (err) {
     console.error('❌ Ошибка автопереключения:', err);
     if (ADMIN) {
       await bot.sendMessage(
           ADMIN,
           `❌ Ошибка авто-режима ORG${orgId} (ext ${ext}, status ${status}): ${err.message}`
-      ).catch(()=>{});
+      ).catch(() => {});
     }
   }
 });
