@@ -396,7 +396,6 @@ app.post('/extension-status', async (req, res) => {
   }
 
   // интересуют только два статуса
-  const INTERESTING = new Set(['registered', 'unavailable']);
   if (!INTERESTING.has(st)) {
     console.log(`ℹ️ ext ${ext}: status "${st}" — игнорируем (БД/лог без изменений)`);
     return;
@@ -409,14 +408,14 @@ app.post('/extension-status', async (req, res) => {
   }
   const { orgId, chatId, org } = match;
 
-  // прошлый ЗНАЧИМЫЙ статус из памяти
+  // прошлый значимый статус из памяти
   const prev = state.ext[ext]?.status || null;
   if (prev === st) {
     console.log(`[STATE] ext ${ext}: status "${st}" not changed — skip (БД/лог не трогаем)`);
     return;
   }
 
-  // сохраняем новый ЗНАЧИМЫЙ статус (только registered/unavailable)
+  // сохраняем новый значимый статус
   const ts = Date.now();
   state.ext[ext] = { status: st, ts };
   saveStateDebounced();
@@ -425,10 +424,9 @@ app.post('/extension-status', async (req, res) => {
   stmtUpsertExt.run({ ext, org_id: orgId, status: st, ts });
   stmtInsertLog.run({ ext, org_id: orgId, status: st, ts });
 
-  // обработка статусов с таймерной логикой
+  // автологика
   try {
     if (st === 'registered') {
-      // Любая регистрация отменяет отложенный Mob и тащит SIP
       cancelMobTimer(orgId, 'registered received');
       if (!canSwitch(orgId, 'SIP')) {
         console.log(`⏱️ Cooldown SIP ORG${orgId}`);
@@ -553,23 +551,22 @@ bot.onText(/\/timers/, (msg) => {
 });
 
 // админ: статус из БД (по всем или по конкретной ORG)
-bot.onText(/\/dbstate(?:\s+(\d+))?/, (msg, m) => {
-  if (!ADMIN || msg.chat.id !== ADMIN) return;
-  const orgId = m?.[1] ? Number(m[1]) : null;
-  let rows;
-  if (orgId) {
-    rows = stmtOrgExts.all(orgId);
-  } else {
-    rows = stmtAllExts.all();
-  }
-  if (!rows.length) {
-    bot.sendMessage(msg.chat.id, 'БД пуста');
-    return;
-  }
-  const out = rows.map(r =>
-      `ORG${r.org_id} EXT ${r.ext}: ${r.status ?? '(нет данных)'} @ ${r.ts ? new Date(r.ts).toLocaleString() : '-'}`
-  ).join('\n');
-  bot.sendMessage(msg.chat.id, out);
-});
+  bot.onText(/\/dbstate(?:\s+(\d+))?/, (msg, m) => {
+    if (!ADMIN || msg.chat.id !== ADMIN) return;
+
+    const orgId = m?.[1] ? Number(m[1]) : null;
+    const rows = orgId ? stmtOrgExts.all(orgId) : stmtAllExts.all();
+
+    if (!rows.length) {
+      bot.sendMessage(msg.chat.id, 'БД пуста');
+      return;
+    }
+
+    const out = rows.map(r =>
+        `ORG${r.org_id} EXT ${r.ext}: ${r.status ?? '(нет данных)'} @ ${r.ts ? new Date(r.ts).toLocaleString() : '-'}`
+    ).join('\n');
+
+    bot.sendMessage(msg.chat.id, out);
+  });
 
 console.log('Bot started');
