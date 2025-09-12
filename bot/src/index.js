@@ -54,19 +54,8 @@ const ORGS_BY_ID = Object.values(ORGS).reduce((acc, org) => {
 console.log('Loaded org chat IDs:', Object.keys(ORGS));
 console.log('Loaded org IDs:', Object.keys(ORGS_BY_ID));
 
-function resolveOrgByExtension(ext) {
-  for (const [orgId, set] of ORG_EXTS.entries()) {
-    if (set.has(ext)) {
-      const org = ORGS_BY_ID[String(orgId)];
-      if (!org) return null;
-      return { orgId: Number(orgId), chatId: org.chatId, org };
-    }
-  }
-  return null;
-}
-
 // ────────────────────────────────────────────────────────────
-// STATE-файл (как раньше) — для обратной совместимости / быстрой проверки
+// STATE-файл — обратная совместимость / быстрая проверка
 
 const STATE_PATH = '/app/data/last-ext-status.json';
 let state = { ext: {} }; // { "<ext>": { status, ts } }
@@ -95,11 +84,8 @@ function saveStateDebounced() {
 }
 
 // ────────────────────────────────────────────────────────────
-/** База данных SQLite: /app/data/bot.db
- * Таблицы:
- *   ext_status(ext TEXT PK, org_id INTEGER, status TEXT, ts INTEGER)
- *   status_log(id INTEGER PK, ext TEXT, org_id INTEGER, status TEXT, ts INTEGER)
- */
+// База данных SQLite: /app/data/bot.db
+
 const DB_PATH = '/app/data/bot.db';
 await fs.promises.mkdir(path.dirname(DB_PATH), { recursive: true });
 const db = new Database(DB_PATH);
@@ -139,15 +125,21 @@ const stmtAnyRegistered = db.prepare(`
 const stmtAllExts = db.prepare(`SELECT ext, org_id, status, ts FROM ext_status ORDER BY org_id, ext`);
 const stmtOrgExts = db.prepare(`SELECT ext, org_id, status, ts FROM ext_status WHERE org_id=? ORDER BY ext`);
 
-// список допустимых экстеншенов из .env (только EXT{ext}_ORG)
-const ALLOWED_EXT = new Set();
-const ORG_EXTS = new Map();
+// ────────────────────────────────────────────────────────────
+// Конфиг номеров: новый формат ORG{N}_EXTS= "1119,7778" (+ legacy фоллбек)
 
+const ALLOWED_EXT = new Set();
+const ORG_EXTS = new Map(); // Map<string orgId, Set<string ext>>
+
+// Новый формат
 for (const [key, val] of Object.entries(process.env)) {
   const m = key.match(/^ORG(\d+)_EXTS$/);
   if (!m) continue;
   const orgId = m[1];
-  const exts = val.split(',').map(s => s.trim()).filter(Boolean);
+  const exts = String(val || '')
+      .split(',')
+      .map(s => s.trim())
+      .filter(Boolean);
   if (!ORG_EXTS.has(orgId)) ORG_EXTS.set(orgId, new Set());
   for (const ext of exts) {
     ORG_EXTS.get(orgId).add(ext);
@@ -155,17 +147,50 @@ for (const [key, val] of Object.entries(process.env)) {
   }
 }
 
-console.log('[STATE] allowed EXT:', [...ALLOWED_EXT]);
+// Legacy фоллбек, если новый не задан
+if (ALLOWED_EXT.size === 0) {
+  for (const [k, v] of Object.entries(process.env)) {
+    const m = k.match(/^EXT(\d+)_ORG$/);
+    if (!m) continue;
+    const ext = m[1];
+    const orgId = String(v);
+    if (!ORG_EXTS.has(orgId)) ORG_EXTS.set(orgId, new Set());
+    ORG_EXTS.get(orgId).add(ext);
+    ALLOWED_EXT.add(ext);
+  }
+}
 
+console.log('[CFG] ORG_EXTS:', [...ORG_EXTS.entries()].map(([org, set]) => [org, [...set]]));
+console.log('[CFG] allowed EXT:', [...ALLOWED_EXT]);
 
-// Инициализируем ext_status из .env (если строк нет)
-db.transaction(() => {
+function resolveOrgByExtension(ext) {
   for (const [orgId, set] of ORG_EXTS.entries()) {
-    for (const ext of set) {
-      stmtUpsertExt.run({ ext, org_id: Number(orgId), status: null, ts: Date.now() });
+    if (set.has(ext)) {
+      const org = ORGS_BY_ID[String(orgId)];
+      if (!org) return null;
+      return { orgId: Number(orgId), chatId: org.chatId, org };
     }
   }
+  return null;
+}
+
+// Синхронизация БД с конфигом
+db.transaction(() => {
+  const now = Date.now();
+  for (const [orgId, set] of ORG_EXTS.entries()) {
+    for (const ext of set) {
+      stmtUpsertExt.run({ ext, org_id: Number(orgId), status: null, ts: now });
+    }
+  }
+  const allowed = [...ALLOWED_EXT];
+  if (allowed.length > 0) {
+    const placeholders = allowed.map(() => '?').join(',');
+    db.prepare(`DELETE FROM ext_status WHERE ext NOT IN (${placeholders})`).run(...allowed);
+  }
 })();
+
+// ────────────────────────────────────────────────────────────
+// Логика статусов / переключений
 
 function anyExtRegisteredInOrg(orgId) {
   const row = stmtAnyRegistered.get(orgId);
@@ -179,13 +204,10 @@ function normStatus(s) {
   return v; // ringing, busy, etc.
 }
 
-// ────────────────────────────────────────────────────────────
-// Проверка: активен ли уже нужный режим по наборам экстеншенов
-
 function isModeActiveOnMembers(org, members, mode) {
   const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
   const extractExt = (s) => {
-    const m = norm(s).match(/\b(\d{3})\b/);
+    const m = norm(s).match(/\b(\d{3,})\b/); // ← закрываем слешем, не бэктиком
     return m ? m[1] : null;
   };
 
@@ -214,9 +236,7 @@ function canSwitch(orgId, mode) {
   return ok;
 }
 
-// ────────────────────────────────────────────────────────────
 // Таймеры "отложить Mob"
-
 const PENDING_MOB = new Map(); // orgId -> { t: Timeout, untilTs: number }
 
 function cancelMobTimer(orgId, reason = '') {
@@ -267,7 +287,6 @@ globalThis.__sendShot = async (file, name) => {
   } catch {}
 };
 
-// Клавиатура и проверки доступа
 const mainKeyboard = {
   reply_markup: {
     keyboard: [
@@ -287,9 +306,7 @@ function onlyAdminOrGroup(msg) {
   return false;
 }
 
-// ────────────────────────────────────────────────────────────
 // Выполнение режима для конкретной организации
-
 async function triggerModeForOrg(mode, { chatId, org }) {
   const { login, password, group_url } = org;
   const tag = `auto-${mode.toLowerCase()}`;
@@ -357,7 +374,7 @@ async function withClientForOrg(msg, fn, { tag = 'op' } = {}) {
 }
 
 // ────────────────────────────────────────────────────────────
-// HTTP Webhook (единственный маршрут)
+// HTTP Webhook
 
 const app = express();
 app.use(express.json());
@@ -372,9 +389,9 @@ app.post('/extension-status', async (req, res) => {
 
   if ((event && event !== 'ExtensionStatus') || !ext || !st) return;
 
-  // игнорируем номера, которых нет в .env
+  // игнорируем номера, которых нет в конфиге
   if (!ALLOWED_EXT.has(ext)) {
-    console.log(`[DEBUG] skip ext ${ext}: not in .env EXT{ext}_ORG`);
+    console.log(`[DEBUG] skip ext ${ext}: not in configured ORG{N}_EXTS/legacy`);
     return;
   }
 
@@ -395,21 +412,19 @@ app.post('/extension-status', async (req, res) => {
     return;
   }
 
-  // сохраняем новый статус в память + файл
+  // сохраняем новый статус
   const ts = Date.now();
   state.ext[ext] = { status: st, ts };
   saveStateDebounced();
 
-  // и обязательно — в БД (и в лог)
+  // и в БД + лог
   stmtUpsertExt.run({ ext, org_id: orgId, status: st, ts });
   stmtInsertLog.run({ ext, org_id: orgId, status: st, ts });
 
   // обработка статусов с таймерной логикой
   try {
     if (st === 'registered') {
-      // Любая регистрация в ORG отменяет отложенный Mob
       cancelMobTimer(orgId, 'registered received');
-
       if (!canSwitch(orgId, 'SIP')) {
         console.log(`⏱️ Cooldown SIP ORG${orgId}`);
         return;
@@ -419,12 +434,10 @@ app.post('/extension-status', async (req, res) => {
     }
 
     if (st === 'unavailable') {
-      // Если хоть один ext зарегистрирован — не ставим таймер
       if (anyExtRegisteredInOrg(orgId)) {
         console.log(`[AUTO] ORG${orgId}: минимум один ext registered — таймер Mob не ставлю`);
         return;
       }
-      // Ставим/перезапускаем таймер — через GRACE_SEC сделаем Mob, если никто не "поднимется"
       scheduleMobTimer({ orgId, chatId, org });
       return;
     }
@@ -444,7 +457,7 @@ app.post('/extension-status', async (req, res) => {
 app.listen(4000, () => console.log('Webhook listening on port 4000'));
 
 // ────────────────────────────────────────────────────────────
-/** Команды/кнопки для групп */
+// Команды/кнопки для групп
 
 async function handleSip(msg) {
   if (!onlyAdminOrGroup(msg)) return;
@@ -538,10 +551,6 @@ bot.onText(/\/timers/, (msg) => {
 });
 
 // админ: статус из БД (по всем или по конкретной ORG)
-/**
- * /dbstate            — показать все ext из БД
- * /dbstate 5          — показать только ORG5
- */
 bot.onText(/\/dbstate(?:\s+(\d+))?/, (msg, m) => {
   if (!ADMIN || msg.chat.id !== ADMIN) return;
   const orgId = m?.[1] ? Number(m[1]) : null;
