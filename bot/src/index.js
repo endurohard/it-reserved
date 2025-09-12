@@ -10,12 +10,23 @@ import Database from 'better-sqlite3';
 
 // ────────────────────────────────────────────────────────────
 // Настройки/утилиты
+
+// интересуют только два статуса
 const INTERESTING = new Set(['registered', 'unavailable']);
+
 const COOLDOWN_SEC = Number(process.env.SWITCH_COOLDOWN_SEC || 60);
 const GRACE_SEC    = Number(process.env.UNAVAILABLE_GRACE_SEC || 60); // ожидание после Unavailable
 
 function parseList(val) {
   return (val || '').split(',').map(s => s.trim()).filter(Boolean);
+}
+
+// Нормализация статусов из вебхука
+function normStatus(s) {
+  const v = String(s ?? '').trim().toLowerCase();
+  if (v === 'registered') return 'registered';
+  if (v === 'unavailable' || v === 'unregistered' || v === 'not registered') return 'unavailable';
+  return v; // ringing, busy, etc. — нас не интересуют
 }
 
 function loadOrgsFromEnv(max = 100) {
@@ -187,7 +198,7 @@ db.transaction(() => {
     const placeholders = allowed.map(() => '?').join(',');
     db.prepare(`DELETE FROM ext_status WHERE ext NOT IN (${placeholders})`).run(...allowed);
   }
-})();
+});
 
 // ────────────────────────────────────────────────────────────
 // Логика статусов / переключений
@@ -197,11 +208,10 @@ function anyExtRegisteredInOrg(orgId) {
   return !!row;
 }
 
-
 function isModeActiveOnMembers(org, members, mode) {
   const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
   const extractExt = (s) => {
-    const m = norm(s).match(/\b(\d{3,})\b/); // ← закрываем слешем, не бэктиком
+    const m = norm(s).match(/\b(\d{3,})\b/);
     return m ? m[1] : null;
   };
 
@@ -214,7 +224,11 @@ function isModeActiveOnMembers(org, members, mode) {
   const allAddPresent = adds.every(p => present.has(p));
   const allRemoveAbsent = removes.every(p => !present.has(p));
 
-  console.log(`[CHK] mode=${mode} present=${JSON.stringify([...present])} needAdd=${JSON.stringify(adds)} needRm=${JSON.stringify(removes)} -> addOK=${allAddPresent} rmOK=${allRemoveAbsent}`);
+  console.log(
+      `[CHK] mode=${mode} present=${JSON.stringify([...present])} ` +
+      `needAdd=${JSON.stringify(adds)} needRm=${JSON.stringify(removes)} ` +
+      `-> addOK=${allAddPresent} rmOK=${allRemoveAbsent}`
+  );
 
   return allAddPresent && allRemoveAbsent;
 }
@@ -372,7 +386,6 @@ async function withClientForOrg(msg, fn, { tag = 'op' } = {}) {
 
 const app = express();
 app.use(express.json());
-
 
 app.post('/extension-status', async (req, res) => {
   res.json({ ok: true });
@@ -546,22 +559,22 @@ bot.onText(/\/timers/, (msg) => {
 });
 
 // админ: статус из БД (по всем или по конкретной ORG)
-  bot.onText(/\/dbstate(?:\s+(\d+))?/, (msg, m) => {
-    if (!ADMIN || msg.chat.id !== ADMIN) return;
+bot.onText(/\/dbstate(?:\s+(\d+))?/, (msg, m) => {
+  if (!ADMIN || msg.chat.id !== ADMIN) return;
 
-    const orgId = m?.[1] ? Number(m[1]) : null;
-    const rows = orgId ? stmtOrgExts.all(orgId) : stmtAllExts.all();
+  const orgId = m?.[1] ? Number(m[1]) : null;
+  const rows = orgId ? stmtOrgExts.all(orgId) : stmtAllExts.all();
 
-    if (!rows.length) {
-      bot.sendMessage(msg.chat.id, 'БД пуста');
-      return;
-    }
+  if (!rows.length) {
+    bot.sendMessage(msg.chat.id, 'БД пуста');
+    return;
+  }
 
-    const out = rows.map(r =>
-        `ORG${r.org_id} EXT ${r.ext}: ${r.status ?? '(нет данных)'} @ ${r.ts ? new Date(r.ts).toLocaleString() : '-'}`
-    ).join('\n');
+  const out = rows.map(r =>
+      `ORG${r.org_id} EXT ${r.ext}: ${r.status ?? '(нет данных)'} @ ${r.ts ? new Date(r.ts).toLocaleString() : '-'}`
+  ).join('\n');
 
-    bot.sendMessage(msg.chat.id, out);
-  });
+  bot.sendMessage(msg.chat.id, out);
+});
 
 console.log('Bot started');
