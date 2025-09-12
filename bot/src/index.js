@@ -55,11 +55,14 @@ console.log('Loaded org chat IDs:', Object.keys(ORGS));
 console.log('Loaded org IDs:', Object.keys(ORGS_BY_ID));
 
 function resolveOrgByExtension(ext) {
-  const orgId = process.env[`EXT${ext}_ORG`];
-  if (!orgId) return null;
-  const org = ORGS_BY_ID[String(orgId)];
-  if (!org) return null;
-  return { orgId: Number(orgId), chatId: org.chatId, org };
+  for (const [orgId, set] of ORG_EXTS.entries()) {
+    if (set.has(ext)) {
+      const org = ORGS_BY_ID[String(orgId)];
+      if (!org) return null;
+      return { orgId: Number(orgId), chatId: org.chatId, org };
+    }
+  }
+  return null;
 }
 
 // ────────────────────────────────────────────────────────────
@@ -137,24 +140,23 @@ const stmtAllExts = db.prepare(`SELECT ext, org_id, status, ts FROM ext_status O
 const stmtOrgExts = db.prepare(`SELECT ext, org_id, status, ts FROM ext_status WHERE org_id=? ORDER BY ext`);
 
 // список допустимых экстеншенов из .env (только EXT{ext}_ORG)
-const ALLOWED_EXT = new Set(
-    Object.keys(process.env)
-        .map(k => k.match(/^EXT(\d+)_ORG$/))
-        .filter(Boolean)
-        .map(m => m[1])
-);
+const ALLOWED_EXT = new Set();
+const ORG_EXTS = new Map();
+
+for (const [key, val] of Object.entries(process.env)) {
+  const m = key.match(/^ORG(\d+)_EXTS$/);
+  if (!m) continue;
+  const orgId = m[1];
+  const exts = val.split(',').map(s => s.trim()).filter(Boolean);
+  if (!ORG_EXTS.has(orgId)) ORG_EXTS.set(orgId, new Set());
+  for (const ext of exts) {
+    ORG_EXTS.get(orgId).add(ext);
+    ALLOWED_EXT.add(ext);
+  }
+}
+
 console.log('[STATE] allowed EXT:', [...ALLOWED_EXT]);
 
-// Карта orgId -> Set(ext) по .env
-const ORG_EXTS = new Map();
-for (const [k, v] of Object.entries(process.env)) {
-  const m = k.match(/^EXT(\d+)_ORG$/);
-  if (!m) continue;
-  const ext = m[1];
-  const orgId = String(v);
-  if (!ORG_EXTS.has(orgId)) ORG_EXTS.set(orgId, new Set());
-  ORG_EXTS.get(orgId).add(ext);
-}
 
 // Инициализируем ext_status из .env (если строк нет)
 db.transaction(() => {
