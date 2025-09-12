@@ -10,7 +10,7 @@ import Database from 'better-sqlite3';
 
 // ────────────────────────────────────────────────────────────
 // Настройки/утилиты
-
+const INTERESTING = new Set(['registered', 'unavailable']);
 const COOLDOWN_SEC = Number(process.env.SWITCH_COOLDOWN_SEC || 60);
 const GRACE_SEC    = Number(process.env.UNAVAILABLE_GRACE_SEC || 60); // ожидание после Unavailable
 
@@ -197,12 +197,6 @@ function anyExtRegisteredInOrg(orgId) {
   return !!row;
 }
 
-function normStatus(s) {
-  const v = String(s || '').trim().toLowerCase();
-  if (v === 'registered') return 'registered';
-  if (v === 'unavailable' || v === 'unregistered' || v === 'not registered') return 'unavailable';
-  return v; // ringing, busy, etc.
-}
 
 function isModeActiveOnMembers(org, members, mode) {
   const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
@@ -378,6 +372,7 @@ async function withClientForOrg(msg, fn, { tag = 'op' } = {}) {
 
 const app = express();
 app.use(express.json());
+
 
 app.post('/extension-status', async (req, res) => {
   res.json({ ok: true });
