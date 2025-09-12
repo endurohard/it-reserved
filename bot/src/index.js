@@ -6,6 +6,7 @@ import { MtsClient } from './mtsClient.js';
 import fs from 'fs';
 import path from 'node:path';
 import express from 'express';
+import Database from 'better-sqlite3';
 
 // ────────────────────────────────────────────────────────────
 // Настройки/утилиты
@@ -62,10 +63,10 @@ function resolveOrgByExtension(ext) {
 }
 
 // ────────────────────────────────────────────────────────────
-// STATE: хранение последнего статуса экстеншенов
+// STATE-файл (как раньше) — для обратной совместимости / быстрой проверки
 
 const STATE_PATH = '/app/data/last-ext-status.json';
-let state = { ext: {} }; // { "<ext>": { status: "registered|unavailable|...", ts: 123 } }
+let state = { ext: {} }; // { "<ext>": { status, ts } }
 
 try {
   const raw = fs.existsSync(STATE_PATH) ? await fs.promises.readFile(STATE_PATH, 'utf8') : '{}';
@@ -90,6 +91,51 @@ function saveStateDebounced() {
   }, 200);
 }
 
+// ────────────────────────────────────────────────────────────
+/** База данных SQLite: /app/data/bot.db
+ * Таблицы:
+ *   ext_status(ext TEXT PK, org_id INTEGER, status TEXT, ts INTEGER)
+ *   status_log(id INTEGER PK, ext TEXT, org_id INTEGER, status TEXT, ts INTEGER)
+ */
+const DB_PATH = '/app/data/bot.db';
+await fs.promises.mkdir(path.dirname(DB_PATH), { recursive: true });
+const db = new Database(DB_PATH);
+db.pragma('journal_mode = WAL');
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS ext_status (
+    ext     TEXT PRIMARY KEY,
+    org_id  INTEGER NOT NULL,
+    status  TEXT,
+    ts      INTEGER
+  );
+  CREATE TABLE IF NOT EXISTS status_log (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    ext     TEXT NOT NULL,
+    org_id  INTEGER NOT NULL,
+    status  TEXT NOT NULL,
+    ts      INTEGER NOT NULL
+  );
+`);
+
+const stmtUpsertExt = db.prepare(`
+  INSERT INTO ext_status (ext, org_id, status, ts)
+  VALUES (@ext, @org_id, @status, @ts)
+  ON CONFLICT(ext) DO UPDATE SET
+    org_id=excluded.org_id,
+    status=excluded.status,
+    ts=excluded.ts
+`);
+const stmtInsertLog = db.prepare(`
+  INSERT INTO status_log (ext, org_id, status, ts)
+  VALUES (@ext, @org_id, @status, @ts)
+`);
+const stmtAnyRegistered = db.prepare(`
+  SELECT 1 FROM ext_status WHERE org_id=? AND status='registered' LIMIT 1
+`);
+const stmtAllExts = db.prepare(`SELECT ext, org_id, status, ts FROM ext_status ORDER BY org_id, ext`);
+const stmtOrgExts = db.prepare(`SELECT ext, org_id, status, ts FROM ext_status WHERE org_id=? ORDER BY ext`);
+
 // список допустимых экстеншенов из .env (только EXT{ext}_ORG)
 const ALLOWED_EXT = new Set(
     Object.keys(process.env)
@@ -99,7 +145,7 @@ const ALLOWED_EXT = new Set(
 );
 console.log('[STATE] allowed EXT:', [...ALLOWED_EXT]);
 
-// Карта orgId -> Set(ext) из .env
+// Карта orgId -> Set(ext) по .env
 const ORG_EXTS = new Map();
 for (const [k, v] of Object.entries(process.env)) {
   const m = k.match(/^EXT(\d+)_ORG$/);
@@ -109,13 +155,19 @@ for (const [k, v] of Object.entries(process.env)) {
   if (!ORG_EXTS.has(orgId)) ORG_EXTS.set(orgId, new Set());
   ORG_EXTS.get(orgId).add(ext);
 }
-function anyExtRegisteredInOrg(orgId) {
-  const set = ORG_EXTS.get(String(orgId));
-  if (!set || !set.size) return false;
-  for (const ext of set) {
-    if (state.ext[ext]?.status === 'registered') return true;
+
+// Инициализируем ext_status из .env (если строк нет)
+db.transaction(() => {
+  for (const [orgId, set] of ORG_EXTS.entries()) {
+    for (const ext of set) {
+      stmtUpsertExt.run({ ext, org_id: Number(orgId), status: null, ts: Date.now() });
+    }
   }
-  return false;
+})();
+
+function anyExtRegisteredInOrg(orgId) {
+  const row = stmtAnyRegistered.get(orgId);
+  return !!row;
 }
 
 function normStatus(s) {
@@ -131,14 +183,11 @@ function normStatus(s) {
 function isModeActiveOnMembers(org, members, mode) {
   const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
   const extractExt = (s) => {
-    const m = norm(s).match(/\b(\d{3})\b/); // берём первую "###"
+    const m = norm(s).match(/\b(\d{3})\b/);
     return m ? m[1] : null;
   };
 
-  // фактически присутствующие экстеншены справа (members)
-  const present = new Set(
-      (members || []).map(extractExt).filter(Boolean)
-  );
+  const present = new Set((members || []).map(extractExt).filter(Boolean));
 
   const plan = mode === 'SIP' ? org.sip : org.mob;
   const adds = (plan.add || []).map(String);
@@ -247,32 +296,26 @@ async function triggerModeForOrg(mode, { chatId, org }) {
   const client = new MtsClient(page);
 
   try {
-    // 1) Логин/открытие группы
     await client.login(login, password);
     await client.openGroupUrl(group_url);
 
-    // 2) Чтение текущего состава
     const data = await client.getMembers();
     const members = data?.members || [];
 
-    // 3) Проверка — если режим уже активен, тихо выходим
     if (isModeActiveOnMembers(org, members, mode)) {
       console.log(`[AUTO] ORG${org.id}: режим ${mode} уже активен — пропускаю`);
       return;
     }
 
-    // 4) Только теперь логируем и шлём сообщение в чат
     console.log(`[AUTO] APPLY ${mode} for ORG${org.id} chat=${chatId}`);
     await bot.sendMessage(chatId, `🔄 Auto: применяю режим ${mode}…`).catch(()=>{});
 
-    // 5) Применяем
     if (mode === 'SIP') {
       await client.applyFlow(org.sip.remove, org.sip.add);
     } else {
       await client.applyFlow(org.mob.remove, org.mob.add);
     }
 
-    // 6) Отчёт
     await bot.sendMessage(chatId, `✅ ${mode} применён`).catch(()=>{});
     if (ADMIN && Number(chatId) !== ADMIN) {
       await bot.sendMessage(ADMIN, `✅ ${mode} применён для ORG${org.id} (${chatId})`).catch(()=>{});
@@ -333,7 +376,6 @@ app.post('/extension-status', async (req, res) => {
     return;
   }
 
-  // находим org / чат
   const match = resolveOrgByExtension(ext);
   if (!match) {
     console.log(`[DEBUG] No match for extension ${ext}.`);
@@ -341,24 +383,31 @@ app.post('/extension-status', async (req, res) => {
   }
   const { orgId, chatId, org } = match;
 
-  // сравнение с предыдущим статусом
+  // сравнение с предыдущим статусом (in-memory JSON)
   const prev = state.ext[ext]?.status || null;
   if (prev === st) {
     console.log(`[STATE] ext ${ext}: status "${st}" not changed — skip`);
+    // даже если не менялось — обновим БД ts для мониторинга "последнего пинга"
+    const tsNow = Date.now();
+    stmtUpsertExt.run({ ext, org_id: orgId, status: st, ts: tsNow });
     return;
   }
 
-  // сохраняем новый статус
-  state.ext[ext] = { status: st, ts: Date.now() };
+  // сохраняем новый статус в память + файл
+  const ts = Date.now();
+  state.ext[ext] = { status: st, ts };
   saveStateDebounced();
+
+  // и обязательно — в БД (и в лог)
+  stmtUpsertExt.run({ ext, org_id: orgId, status: st, ts });
+  stmtInsertLog.run({ ext, org_id: orgId, status: st, ts });
 
   // обработка статусов с таймерной логикой
   try {
     if (st === 'registered') {
-      // Любая регистрация по EXT этой ORG отменяет отложенный Mob
+      // Любая регистрация в ORG отменяет отложенный Mob
       cancelMobTimer(orgId, 'registered received');
 
-      // Можно вернуть SIP, но только если реально требуется (и без спама)
       if (!canSwitch(orgId, 'SIP')) {
         console.log(`⏱️ Cooldown SIP ORG${orgId}`);
         return;
@@ -368,7 +417,7 @@ app.post('/extension-status', async (req, res) => {
     }
 
     if (st === 'unavailable') {
-      // Если хотя бы один ext зарегистрирован — вообще не ставим таймер
+      // Если хоть один ext зарегистрирован — не ставим таймер
       if (anyExtRegisteredInOrg(orgId)) {
         console.log(`[AUTO] ORG${orgId}: минимум один ext registered — таймер Mob не ставлю`);
         return;
@@ -378,7 +427,6 @@ app.post('/extension-status', async (req, res) => {
       return;
     }
 
-    // Для прочих статусов (ringing, busy…) действий не требуется
     console.log(`ℹ️ ext ${ext}: status "${st}" — действий нет`);
   } catch (err) {
     console.error('❌ Ошибка автопереключения:', err);
@@ -470,7 +518,7 @@ bot.onText(/\/id/, (msg) => {
   bot.sendMessage(msg.chat.id, `chat.id: ${msg.chat.id}\nchat.title: ${msg.chat.title || '(нет)'}`);
 });
 
-// админская диагностика состояния
+// админ: текущее in-memory состояние
 bot.onText(/\/state(?:\s+(\d+))?/, (msg) => {
   if (!ADMIN || msg.chat.id !== ADMIN) return;
   const lines = Object.entries(state.ext)
@@ -485,6 +533,30 @@ bot.onText(/\/timers/, (msg) => {
       `ORG${orgId} → до ${new Date(v.untilTs).toLocaleString()}`
   );
   bot.sendMessage(msg.chat.id, rows.length ? rows.join('\n') : 'Таймеров нет');
+});
+
+// админ: статус из БД (по всем или по конкретной ORG)
+/**
+ * /dbstate            — показать все ext из БД
+ * /dbstate 5          — показать только ORG5
+ */
+bot.onText(/\/dbstate(?:\s+(\d+))?/, (msg, m) => {
+  if (!ADMIN || msg.chat.id !== ADMIN) return;
+  const orgId = m?.[1] ? Number(m[1]) : null;
+  let rows;
+  if (orgId) {
+    rows = stmtOrgExts.all(orgId);
+  } else {
+    rows = stmtAllExts.all();
+  }
+  if (!rows.length) {
+    bot.sendMessage(msg.chat.id, 'БД пуста');
+    return;
+  }
+  const out = rows.map(r =>
+      `ORG${r.org_id} EXT ${r.ext}: ${r.status ?? '(нет данных)'} @ ${r.ts ? new Date(r.ts).toLocaleString() : '-'}`
+  ).join('\n');
+  bot.sendMessage(msg.chat.id, out);
 });
 
 console.log('Bot started');
