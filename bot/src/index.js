@@ -50,6 +50,7 @@ function loadOrgsFromEnv(max = 100) {
       login,
       password,
       group_url: groupUrl,
+      threadId: process.env[`ORG${i}_THREAD_ID`] ? Number(process.env[`ORG${i}_THREAD_ID`]) : null,
       sip: {
         remove: parseList(process.env[`ORG${i}_SIP_REMOVE`]),
         add:    parseList(process.env[`ORG${i}_SIP_ADD`]),
@@ -513,27 +514,51 @@ app.listen(4000, () => console.log('Webhook listening on port 4000'));
 
 async function handleSip(msg) {
   if (!onlyAdminOrGroup(msg)) return;
+
+  // достаём org по chat.id
+  const org = ORGS[String(msg.chat.id)];
+  const extra = {};
+  if (org?.threadId != null) extra.message_thread_id = Number(org.threadId);
+
   try {
-    await bot.sendMessage(msg.chat.id, '🔄 SIP: Перевожу на компьютеры');
-    await withClientForOrg(msg, async (c, org) => {
-      await c.applyFlow(org.sip.remove, org.sip.add);
-    }, { tag: 'sip' });
-    await bot.sendMessage(msg.chat.id, '✅ SIP применён');
+    await bot.sendMessage(msg.chat.id, '🔄 SIP: Перевожу на компьютеры', extra);
+
+    await withClientForOrg(
+        msg,
+        async (c, orgInner) => {
+          await c.applyFlow(orgInner.sip.remove, orgInner.sip.add);
+        },
+        { tag: 'sip' }
+    );
+
+    await bot.sendMessage(msg.chat.id, '✅ SIP применён', extra);
   } catch (e) {
-    await bot.sendMessage(msg.chat.id, '❌ Ошибка SIP: ' + e.message);
+    await bot.sendMessage(msg.chat.id, '❌ Ошибка SIP: ' + e.message, extra);
   }
 }
 
 async function handleMob(msg) {
   if (!onlyAdminOrGroup(msg)) return;
+
+  // достаём org по chat.id
+  const org = ORGS[String(msg.chat.id)];
+  const extra = {};
+  if (org?.threadId != null) extra.message_thread_id = Number(org.threadId);
+
   try {
-    await bot.sendMessage(msg.chat.id, '🔄 Mob: Перевожу на GSM');
-    await withClientForOrg(msg, async (c, org) => {
-      await c.applyFlow(org.mob.remove, org.mob.add);
-    }, { tag: 'mob' });
-    await bot.sendMessage(msg.chat.id, '✅ Mob применён');
+    await bot.sendMessage(msg.chat.id, '🔄 Mob: Перевожу на GSM', extra);
+
+    await withClientForOrg(
+        msg,
+        async (c, orgInner) => {
+          await c.applyFlow(orgInner.mob.remove, orgInner.mob.add);
+        },
+        { tag: 'mob' }
+    );
+
+    await bot.sendMessage(msg.chat.id, '✅ Mob применён', extra);
   } catch (e) {
-    await bot.sendMessage(msg.chat.id, '❌ Ошибка Mob: ' + e.message);
+    await bot.sendMessage(msg.chat.id, '❌ Ошибка Mob: ' + e.message, extra);
   }
 }
 
