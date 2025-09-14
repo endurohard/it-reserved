@@ -306,6 +306,19 @@ function scheduleMobTimer({ orgId, chatId, org }) {
 const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: true });
 const ADMIN = process.env.ADMIN_CHAT_ID ? Number(process.env.ADMIN_CHAT_ID) : null;
 
+// Хелперы: отправка сообщений/фото в указанную тему (если она настроена)
+function sendMsg(chatId, text, org, opts = {}) {
+  const options = { ...opts };
+  if (org?.threadId) options.message_thread_id = Number(org.threadId);
+  return bot.sendMessage(Number(chatId), text, options);
+}
+
+function sendPhoto(chatId, photo, org, opts = {}) {
+  const options = { ...opts };
+  if (org?.threadId) options.message_thread_id = Number(org.threadId);
+  return bot.sendPhoto(Number(chatId), photo, options);
+}
+
 // авто-рассылка скринов администратору (если включено)
 globalThis.__sendShot = async (file, name) => {
   try {
@@ -330,7 +343,7 @@ function onlyAdminOrGroup(msg) {
   const isAdmin = ADMIN && msg.chat.id === ADMIN;
   const isOrgChat = !!ORGS[String(msg.chat.id)];
   if (isAdmin || isOrgChat) return true;
-  bot.sendMessage(msg.chat.id, '⛔️ Нет доступа');
+  bot.sendMessage(msg.chat.id, '⛔️ Нет доступа'); // системное — без темы
   return false;
 }
 
@@ -357,7 +370,7 @@ async function triggerModeForOrg(mode, { chatId, org }) {
     }
 
     console.log(`[AUTO] APPLY ${mode} for ORG${org.id} chat=${chatId}`);
-    await bot.sendMessage(chatId, `🔄 Auto: применяю режим ${mode}…`).catch(()=>{});
+    await sendMsg(chatId, `🔄 Auto: применяю режим ${mode}…`, org).catch(()=>{});
 
     if (mode === 'SIP') {
       await client.applyFlow(org.sip.remove, org.sip.add);
@@ -365,7 +378,7 @@ async function triggerModeForOrg(mode, { chatId, org }) {
       await client.applyFlow(org.mob.remove, org.mob.add);
     }
 
-    await bot.sendMessage(chatId, `✅ ${mode} применён`).catch(()=>{});
+    await sendMsg(chatId, `✅ ${mode} применён`, org).catch(()=>{});
     if (ADMIN && Number(chatId) !== ADMIN) {
       await bot.sendMessage(ADMIN, `✅ ${mode} применён для ORG${org.id} (${chatId})`).catch(()=>{});
     }
@@ -395,7 +408,8 @@ async function withClientForOrg(msg, fn, { tag = 'op' } = {}) {
   } catch (e) {
     try {
       const file = await snapshot(page, `error-${tag}`);
-      await bot.sendPhoto(ADMIN || msg.chat.id, file, { caption: `❌ Ошибка (${tag}): ${e.message}` });
+      if (file) await sendPhoto(msg.chat.id, file, org, { caption: `❌ Ошибка (${tag}): ${e.message}` });
+      else await sendMsg(msg.chat.id, `❌ Ошибка (${tag}): ${e.message}`, org);
     } catch {}
     throw e;
   } finally {
@@ -515,13 +529,9 @@ app.listen(4000, () => console.log('Webhook listening on port 4000'));
 async function handleSip(msg) {
   if (!onlyAdminOrGroup(msg)) return;
 
-  // достаём org по chat.id
   const org = ORGS[String(msg.chat.id)];
-  const extra = {};
-  if (org?.threadId != null) extra.message_thread_id = Number(org.threadId);
-
   try {
-    await bot.sendMessage(msg.chat.id, '🔄 SIP: Перевожу на компьютеры', extra);
+    await sendMsg(msg.chat.id, '🔄 SIP: Перевожу на компьютеры', org);
 
     await withClientForOrg(
         msg,
@@ -531,22 +541,18 @@ async function handleSip(msg) {
         { tag: 'sip' }
     );
 
-    await bot.sendMessage(msg.chat.id, '✅ SIP применён', extra);
+    await sendMsg(msg.chat.id, '✅ SIP применён', org);
   } catch (e) {
-    await bot.sendMessage(msg.chat.id, '❌ Ошибка SIP: ' + e.message, extra);
+    await sendMsg(msg.chat.id, '❌ Ошибка SIP: ' + e.message, org);
   }
 }
 
 async function handleMob(msg) {
   if (!onlyAdminOrGroup(msg)) return;
 
-  // достаём org по chat.id
   const org = ORGS[String(msg.chat.id)];
-  const extra = {};
-  if (org?.threadId != null) extra.message_thread_id = Number(org.threadId);
-
   try {
-    await bot.sendMessage(msg.chat.id, '🔄 Mob: Перевожу на GSM', extra);
+    await sendMsg(msg.chat.id, '🔄 Mob: Перевожу на GSM', org);
 
     await withClientForOrg(
         msg,
@@ -556,9 +562,9 @@ async function handleMob(msg) {
         { tag: 'mob' }
     );
 
-    await bot.sendMessage(msg.chat.id, '✅ Mob применён', extra);
+    await sendMsg(msg.chat.id, '✅ Mob применён', org);
   } catch (e) {
-    await bot.sendMessage(msg.chat.id, '❌ Ошибка Mob: ' + e.message, extra);
+    await sendMsg(msg.chat.id, '❌ Ошибка Mob: ' + e.message, org);
   }
 }
 
@@ -569,11 +575,13 @@ bot.onText(/\/mob\b/i, handleMob);
 
 bot.onText(/\/start/, (msg) => {
   if (!onlyAdminOrGroup(msg)) return;
-  bot.sendMessage(msg.chat.id, 'Выберите режим или используйте команды:', mainKeyboard);
+  const org = ORGS[String(msg.chat.id)];
+  sendMsg(msg.chat.id, 'Выберите режим или используйте команды:', org, { reply_markup: mainKeyboard.reply_markup });
 });
 
 bot.onText(/\/status/, async (msg) => {
   if (!onlyAdminOrGroup(msg)) return;
+  const org = ORGS[String(msg.chat.id)];
   try {
     const data = await withClientForOrg(msg, async (c) => c.getMembers(), { tag: 'status' });
     const txt = `Доступные (слева):
@@ -581,14 +589,15 @@ bot.onText(/\/status/, async (msg) => {
 
 Участники группы (справа):
 - ${data.members.join('\n- ')}`;
-    await bot.sendMessage(msg.chat.id, txt);
+    await sendMsg(msg.chat.id, txt, org);
   } catch (e) {
-    await bot.sendMessage(msg.chat.id, 'Ошибка /status: ' + e.message);
+    await sendMsg(msg.chat.id, 'Ошибка /status: ' + e.message, org);
   }
 });
 
 bot.onText(/\/screens(?:\s+(\d+))?/, async (msg, m) => {
   if (!onlyAdminOrGroup(msg)) return;
+  const org = ORGS[String(msg.chat.id)];
   const limit = Math.min(Number(m?.[1] || 5), 20);
   const dir = '/app/data/snapshots';
   try {
@@ -597,17 +606,18 @@ bot.onText(/\/screens(?:\s+(\d+))?/, async (msg, m) => {
         .sort()
         .slice(-limit);
 
-    if (!files.length) return bot.sendMessage(msg.chat.id, 'Скриншотов пока нет.');
+    if (!files.length) return sendMsg(msg.chat.id, 'Скриншотов пока нет.', org);
     for (const f of files) {
-      await bot.sendPhoto(msg.chat.id, path.join(dir, f), { caption: f });
+      await sendPhoto(msg.chat.id, path.join(dir, f), org, { caption: f });
     }
   } catch (e) {
-    await bot.sendMessage(msg.chat.id, 'Ошибка чтения скринов: ' + e.message);
+    await sendMsg(msg.chat.id, 'Ошибка чтения скринов: ' + e.message, org);
   }
 });
 
 bot.onText(/\/id/, (msg) => {
-  bot.sendMessage(msg.chat.id, `chat.id: ${msg.chat.id}\nchat.title: ${msg.chat.title || '(нет)'}`);
+  const org = ORGS[String(msg.chat.id)];
+  sendMsg(msg.chat.id, `chat.id: ${msg.chat.id}\nchat.title: ${msg.chat.title || '(нет)'}`, org);
 });
 
 // админ: текущее in-memory состояние
