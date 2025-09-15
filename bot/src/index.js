@@ -30,9 +30,15 @@ function parseList(val) {
 // Нормализация статусов из вебхука
 function normStatus(s) {
   const v = String(s ?? '').trim().toLowerCase();
-  if (v === 'registered') return 'registered';
-  if (v === 'unavailable' || v === 'unregistered' || v === 'not registered') return 'unavailable';
-  return v; // ringing, busy, etc. — нас не интересуют
+
+  if (['unavailable', 'unregistered', 'not registered'].includes(v)) {
+    return 'unavailable';
+  }
+
+  // всё остальное считаем "registered"
+  if (v) return 'registered';
+
+  return null;
 }
 
 function loadOrgsFromEnv(max = 100) {
