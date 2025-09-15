@@ -11,7 +11,7 @@ import Database from 'better-sqlite3';
 // ────────────────────────────────────────────────────────────
 // Константы/настройки
 
-// интересуют только два статуса
+// Интересуют только два статуса
 const INTERESTING = new Set(['registered', 'unavailable']);
 
 const COOLDOWN_SEC = Number(process.env.SWITCH_COOLDOWN_SEC || 60);
@@ -46,6 +46,7 @@ function loadOrgsFromEnv(max = 100) {
 
     byChatId[String(chatId)] = {
       id: i,
+      name: process.env[`ORG${i}_NAME`] || null, // ← читаем имя
       chatId: String(chatId),
       login,
       password,
@@ -64,6 +65,12 @@ function loadOrgsFromEnv(max = 100) {
   return byChatId;
 }
 
+// Человекочитаемая подпись организации
+function orgLabel(org, orgId) {
+  const name = (org?.name && String(org.name).trim()) || null;
+  return name ? `${name} (ORG${orgId})` : `ORG${orgId}`;
+}
+
 // ────────────────────────────────────────────────────────────
 // ORG из .env
 
@@ -76,7 +83,7 @@ console.log('Loaded org chat IDs:', Object.keys(ORGS));
 console.log('Loaded org IDs:', Object.keys(ORGS_BY_ID));
 
 // ────────────────────────────────────────────────────────────
-// STATE-файл — для быстрой проверки/совместимости
+/** STATE-файл — для быстрой проверки/совместимости */
 
 const STATE_PATH = '/app/data/last-ext-status.json';
 let state = { ext: {} }; // { "<ext>": { status, ts } }
@@ -365,11 +372,11 @@ async function triggerModeForOrg(mode, { chatId, org }) {
     const members = data?.members || [];
 
     if (isModeActiveOnMembers(org, members, mode)) {
-      console.log(`[AUTO] ORG${org.id}: режим ${mode} уже активен — пропускаю`);
+      console.log(`[AUTO] ${orgLabel(org, org.id)}: режим ${mode} уже активен — пропускаю`);
       return;
     }
 
-    console.log(`[AUTO] APPLY ${mode} for ORG${org.id} chat=${chatId}`);
+    console.log(`[AUTO] APPLY ${mode} for ${orgLabel(org, org.id)} chat=${chatId}`);
     await sendMsg(chatId, `🔄 Auto: применяю режим ${mode}…`, org).catch(()=>{});
 
     if (mode === 'SIP') {
@@ -380,13 +387,13 @@ async function triggerModeForOrg(mode, { chatId, org }) {
 
     await sendMsg(chatId, `✅ ${mode} применён`, org).catch(()=>{});
     if (ADMIN && Number(chatId) !== ADMIN) {
-      await bot.sendMessage(ADMIN, `✅ ${mode} применён для ORG${org.id} (${chatId})`).catch(()=>{});
+      await bot.sendMessage(ADMIN, `✅ ${mode} применён для ${orgLabel(org, org.id)} (${chatId})`).catch(()=>{});
     }
   } catch (e) {
     const file = await snapshot(page, `${tag}-error`);
     if (ADMIN) {
-      await bot.sendMessage(ADMIN, `❌ Ошибка ${mode} для ORG${org.id}: ${e.message}`).catch(()=>{});
-      if (file) await bot.sendPhoto(ADMIN, file, { caption: `${mode} ORG${org.id}` }).catch(()=>{});
+      await bot.sendMessage(ADMIN, `❌ Ошибка ${mode} для ${orgLabel(org, org.id)}: ${e.message}`).catch(()=>{});
+      if (file) await bot.sendPhoto(ADMIN, file, { caption: `${mode} ${orgLabel(org, org.id)}` }).catch(()=>{});
     }
     throw e;
   } finally {
@@ -468,6 +475,14 @@ app.post('/extension-status', async (req, res) => {
   stmtUpsertExt.run({ ext, org_id: orgId, status: st, ts });
   stmtInsertLog.run({ ext, org_id: orgId, status: st, ts });
 
+  // уведомление админу о значимом статусе (с именем организации)
+  if (ADMIN) {
+    await bot.sendMessage(
+        ADMIN,
+        `${orgLabel(org, orgId)} EXT ${ext}: ${st} @ ${new Date(ts).toLocaleString()}`
+    ).catch(() => {});
+  }
+
   // автологика
   try {
     if (st === 'registered') {
@@ -476,13 +491,13 @@ app.post('/extension-status', async (req, res) => {
 
       // Если уже уверены, что SIP активен — ничего не делаем
       if (CURRENT_MODE.get(orgId) === 'SIP') {
-        console.log(`[AUTO] ORG${orgId}: уже в режиме SIP (по памяти) — пропускаю без браузера`);
+        console.log(`[AUTO] ${orgLabel(org, orgId)}: уже в режиме SIP (по памяти) — пропускаю без браузера`);
         return;
       }
 
       // Cooldown
       if (!canSwitch(orgId, 'SIP')) {
-        console.log(`⏱️ Cooldown SIP ORG${orgId}`);
+        console.log(`⏱️ Cooldown SIP ${orgLabel(org, orgId)}`);
         return;
       }
 
@@ -494,13 +509,13 @@ app.post('/extension-status', async (req, res) => {
     if (st === 'unavailable') {
       // Если хоть один ext в ORG зарегистрирован — таймер не ставим
       if (anyExtRegisteredInOrg(orgId)) {
-        console.log(`[AUTO] ORG${orgId}: минимум один ext registered — таймер Mob не ставлю`);
+        console.log(`[AUTO] ${orgLabel(org, orgId)}: минимум один ext registered — таймер Mob не ставлю`);
         return;
       }
 
       // Если уже знаем, что стоит Mob (или висит таймер) — ничего не делаем
       if (CURRENT_MODE.get(orgId) === 'Mob' || PENDING_MOB.has(orgId)) {
-        console.log(`[AUTO] ORG${orgId}: Mob уже активен или запланирован — пропускаю`);
+        console.log(`[AUTO] ${orgLabel(org, orgId)}: Mob уже активен или запланирован — пропускаю`);
         return;
       }
 
@@ -515,7 +530,7 @@ app.post('/extension-status', async (req, res) => {
     if (ADMIN) {
       await bot.sendMessage(
           ADMIN,
-          `❌ Ошибка авто-режима ORG${orgId} (ext ${ext}, status ${status}): ${err.message}`
+          `❌ Ошибка авто-режима ${orgLabel(org, orgId)} (ext ${ext}, status ${status}): ${err.message}`
       ).catch(() => {});
     }
   }
@@ -542,8 +557,10 @@ async function handleSip(msg) {
     );
 
     await sendMsg(msg.chat.id, '✅ SIP применён', org);
+    if (ADMIN) await bot.sendMessage(ADMIN, `✅ SIP применён для ${orgLabel(org, org.id)} (${msg.chat.id})`).catch(()=>{});
   } catch (e) {
     await sendMsg(msg.chat.id, '❌ Ошибка SIP: ' + e.message, org);
+    if (ADMIN) await bot.sendMessage(ADMIN, `❌ Ошибка SIP для ${orgLabel(org, org.id)}: ${e.message}`).catch(()=>{});
   }
 }
 
@@ -563,8 +580,10 @@ async function handleMob(msg) {
     );
 
     await sendMsg(msg.chat.id, '✅ Mob применён', org);
+    if (ADMIN) await bot.sendMessage(ADMIN, `✅ Mob применён для ${orgLabel(org, org.id)} (${msg.chat.id})`).catch(()=>{});
   } catch (e) {
     await sendMsg(msg.chat.id, '❌ Ошибка Mob: ' + e.message, org);
+    if (ADMIN) await bot.sendMessage(ADMIN, `❌ Ошибка Mob для ${orgLabel(org, org.id)}: ${e.message}`).catch(()=>{});
   }
 }
 
@@ -632,7 +651,7 @@ bot.onText(/\/state(?:\s+(\d+))?/, (msg) => {
 bot.onText(/\/timers/, (msg) => {
   if (!ADMIN || msg.chat.id !== ADMIN) return;
   const rows = [...PENDING_MOB.entries()].map(([orgId, v]) =>
-      `ORG${orgId} → до ${new Date(v.untilTs).toLocaleString()}`
+      `${orgLabel(ORGS_BY_ID[orgId], orgId)} → до ${new Date(v.untilTs).toLocaleString()}`
   );
   bot.sendMessage(msg.chat.id, rows.length ? rows.join('\n') : 'Таймеров нет');
 });
@@ -654,7 +673,7 @@ bot.onText(/\/dbstate(?:\s+(\d+))?/, (msg, m) => {
   }
 
   const out = rows.map(r =>
-      `ORG${r.org_id} EXT ${r.ext}: ${r.status ?? '(нет данных)'} @ ${r.ts ? new Date(r.ts).toLocaleString() : '-'}`
+      `${orgLabel(ORGS_BY_ID[r.org_id], r.org_id)} EXT ${r.ext}: ${r.status ?? '(нет данных)'} @ ${r.ts ? new Date(r.ts).toLocaleString() : '-'}`
   ).join('\n');
 
   bot.sendMessage(msg.chat.id, out);
