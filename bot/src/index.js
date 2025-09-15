@@ -31,14 +31,17 @@ function parseList(val) {
 function normStatus(s) {
   const v = String(s ?? '').trim().toLowerCase();
 
-  if (['unavailable', 'unregistered', 'not registered'].includes(v)) {
+  // всё, что явно указывает на отсутствие регистрации
+  if (v === 'unavailable' || v === 'unregistered' || v === 'not registered') {
     return 'unavailable';
   }
 
-  // всё остальное считаем "registered"
-  if (v) return 'registered';
+  // всё остальное считаем registered (Registered, Ringing, Busy, Hold, Malfunction, Idle, Fxsnoport и т.д.)
+  if (v) {
+    return 'registered';
+  }
 
-  return null;
+  return null; // если пустая строка или undefined
 }
 
 function loadOrgsFromEnv(max = 100) {
@@ -446,7 +449,7 @@ app.post('/extension-status', async (req, res) => {
 
   if ((event && event !== 'ExtensionStatus') || !ext || !st) return;
 
-  // игнорируем номера, которых нет в конфиге
+  // только разрешённые номера
   if (!ALLOWED_EXT.has(ext)) {
     console.log(`[DEBUG] skip ext ${ext}: not in configured ORG{N}_EXTS/legacy`);
     return;
@@ -465,10 +468,13 @@ app.post('/extension-status', async (req, res) => {
   }
   const { orgId, chatId, org } = match;
 
-  // прошлый значимый статус из памяти
+  // если статус не изменился — выходим
   const prev = state.ext[ext]?.status || null;
   if (prev === st) {
-    console.log(`[STATE] ext ${ext}: status "${st}" not changed — skip (БД/лог не трогаем)`);
+    console.log(`[STATE] ext ${ext}: status "${st}" not changed — skip`);
+    // при желании можно обновлять только ts «пинга»:
+    const tsNow = Date.now();
+    stmtUpsertExt.run({ ext, org_id: orgId, status: st, ts: tsNow });
     return;
   }
 
@@ -477,68 +483,44 @@ app.post('/extension-status', async (req, res) => {
   state.ext[ext] = { status: st, ts };
   saveStateDebounced();
 
-  // БД + лог — только для двух статусов
+  // в БД (и в лог таблицу)
   stmtUpsertExt.run({ ext, org_id: orgId, status: st, ts });
   stmtInsertLog.run({ ext, org_id: orgId, status: st, ts });
 
-  // уведомление админу о значимом статусе (с именем организации)
-  if (ADMIN) {
-    await bot.sendMessage(
-        ADMIN,
-        `${orgLabel(org, orgId)} EXT ${ext}: ${st} @ ${new Date(ts).toLocaleString()}`
-    ).catch(() => {});
-  }
+  // === НИКАКИХ отправок админу здесь нет ===
 
   // автологика
   try {
     if (st === 'registered') {
-      // Любая регистрация отменяет отложенный Mob
       cancelMobTimer(orgId, 'registered');
 
-      // Если уже уверены, что SIP активен — ничего не делаем
       if (CURRENT_MODE.get(orgId) === 'SIP') {
-        console.log(`[AUTO] ${orgLabel(org, orgId)}: уже в режиме SIP (по памяти) — пропускаю без браузера`);
+        console.log(`[AUTO] ${orgLabel(org, orgId)}: уже SIP — пропускаю`);
         return;
       }
-
-      // Cooldown
       if (!canSwitch(orgId, 'SIP')) {
         console.log(`⏱️ Cooldown SIP ${orgLabel(org, orgId)}`);
         return;
       }
-
       await triggerModeForOrg('SIP', { chatId, org });
       CURRENT_MODE.set(orgId, 'SIP');
       return;
     }
 
     if (st === 'unavailable') {
-      // Если хоть один ext в ORG зарегистрирован — таймер не ставим
       if (anyExtRegisteredInOrg(orgId)) {
-        console.log(`[AUTO] ${orgLabel(org, orgId)}: минимум один ext registered — таймер Mob не ставлю`);
+        console.log(`[AUTO] ${orgLabel(org, orgId)}: есть registered — таймер Mob не ставлю`);
         return;
       }
-
-      // Если уже знаем, что стоит Mob (или висит таймер) — ничего не делаем
       if (CURRENT_MODE.get(orgId) === 'Mob' || PENDING_MOB.has(orgId)) {
-        console.log(`[AUTO] ${orgLabel(org, orgId)}: Mob уже активен или запланирован — пропускаю`);
+        console.log(`[AUTO] ${orgLabel(org, orgId)}: Mob уже активен/запланирован — пропускаю`);
         return;
       }
-
-      // Ставим/перезапускаем таймер — через GRACE_SEC сделаем Mob
       scheduleMobTimer({ orgId, chatId, org });
-      return;
     }
-
-    console.log(`ℹ️ ext ${ext}: status "${st}" — действий нет`);
   } catch (err) {
     console.error('❌ Ошибка автопереключения:', err);
-    if (ADMIN) {
-      await bot.sendMessage(
-          ADMIN,
-          `❌ Ошибка авто-режима ${orgLabel(org, orgId)} (ext ${ext}, status ${status}): ${err.message}`
-      ).catch(() => {});
-    }
+    // тут тоже НЕ уведомляем ADMIna — только лог
   }
 });
 
