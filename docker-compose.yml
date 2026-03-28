@@ -6,12 +6,9 @@ services:
     network_mode: host
     environment:
       - IN_DOCKER=true
-      - HTTP_PROXY=http://127.0.0.1:1087
-      - HTTPS_PROXY=http://127.0.0.1:1087
-      - http_proxy=http://127.0.0.1:1087
-      - https_proxy=http://127.0.0.1:1087
       - NO_PROXY=localhost,127.0.0.1
       - no_proxy=localhost,127.0.0.1
+      - TG_PROXY=http://127.0.0.1:1087
     restart: unless-stopped
     volumes:
       - ./bot/src:/app/src

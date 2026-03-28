@@ -6,6 +6,7 @@ import { MtsClient } from './mtsClient.js';
 import fs from 'fs';
 import path from 'node:path';
 import express from 'express';
+import { HttpsProxyAgent } from 'https-proxy-agent';
 import Database from 'better-sqlite3';
 
 // ────────────────────────────────────────────────────────────
@@ -320,7 +321,14 @@ function scheduleMobTimer({ orgId, chatId, org }) {
 // Telegram bot
 
 console.log("[POLLING] Starting bot...");
-const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: true });
+const TG_PROXY = process.env.TG_PROXY || process.env.HTTPS_PROXY || process.env.HTTP_PROXY || '';
+const botOptions = { polling: true };
+if (TG_PROXY) {
+  const agent = new HttpsProxyAgent(TG_PROXY);
+  botOptions.request = { agent };
+  console.log('[TG] Using proxy:', TG_PROXY);
+}
+const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, botOptions);
 
 // Обработка ошибок polling (ECONNRESET через прокси)
 let lastPollingError = 0;
@@ -614,7 +622,28 @@ bot.onText(/\/start/, (msg) => {
 
 bot.onText(/\/status/, async (msg) => {
   if (!onlyAdminOrGroup(msg)) return;
+
+  // Если вызвано из админского чата — показать сводку по всем организациям
+  if (ADMIN && msg.chat.id === ADMIN) {
+    const lines = [];
+    for (const [orgIdStr, org] of Object.entries(ORGS_BY_ID)) {
+      const orgId = Number(orgIdStr);
+      const mode = CURRENT_MODE.get(orgId) || '—';
+      const pending = PENDING_MOB.has(orgId);
+      const exts = stmtOrgExts.all(orgId);
+      const regCount = exts.filter(e => e.status === 'registered').length;
+      const unavCount = exts.filter(e => e.status === 'unavailable').length;
+      const unknownCount = exts.filter(e => !e.status).length;
+      let extLine = `  SIP: ${regCount} | Unavail: ${unavCount}`;
+      if (unknownCount) extLine += ` | ?: ${unknownCount}`;
+      lines.push(`${orgLabel(org, orgId)}: ${mode}${pending ? ' ⏳ Mob pending' : ''}\n${extLine}`);
+    }
+    await bot.sendMessage(msg.chat.id, lines.length ? lines.join('\n\n') : 'Нет организаций');
+    return;
+  }
+
   const org = ORGS[String(msg.chat.id)];
+  if (!org) return;
   try {
     const data = await withClientForOrg(msg, async (c) => c.getMembers(), { tag: 'status' });
     const txt = `Доступные (слева):
