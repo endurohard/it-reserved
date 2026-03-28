@@ -450,8 +450,8 @@ async function withClientForOrg(msg, fn, { tag = 'op' } = {}) {
   } catch (e) {
     try {
       const file = await snapshot(page, `error-${tag}`);
-      if (file) await sendPhoto(msg.chat.id, file, org, { caption: `❌ Ошибка (${tag}): ${e.message}` });
-      else await sendMsg(msg.chat.id, `❌ Ошибка (${tag}): ${e.message}`, org);
+      if (file && ADMIN) await bot.sendPhoto(ADMIN, file, { caption: `❌ Ошибка (${tag}) ${orgLabel(org, org.id)}: ${e.message}` }).catch(()=>{});
+      else if (ADMIN) await bot.sendMessage(ADMIN, `❌ Ошибка (${tag}) ${orgLabel(org, org.id)}: ${e.message}`).catch(()=>{});
     } catch {}
     throw e;
   } finally {
@@ -573,7 +573,7 @@ async function handleSip(msg) {
     await sendMsg(msg.chat.id, '✅ SIP применён', org);
     if (ADMIN) await bot.sendMessage(ADMIN, `✅ SIP применён для ${orgLabel(org, org.id)} (${msg.chat.id})`).catch(()=>{});
   } catch (e) {
-    await sendMsg(msg.chat.id, '❌ Ошибка SIP: ' + e.message, org);
+    // ошибки только админу
     if (ADMIN) await bot.sendMessage(ADMIN, `❌ Ошибка SIP для ${orgLabel(org, org.id)}: ${e.message}`).catch(()=>{});
   }
 }
@@ -596,7 +596,7 @@ async function handleMob(msg) {
     await sendMsg(msg.chat.id, '✅ Mob применён', org);
     if (ADMIN) await bot.sendMessage(ADMIN, `✅ Mob применён для ${orgLabel(org, org.id)} (${msg.chat.id})`).catch(()=>{});
   } catch (e) {
-    await sendMsg(msg.chat.id, '❌ Ошибка Mob: ' + e.message, org);
+    // ошибки только админу
     if (ADMIN) await bot.sendMessage(ADMIN, `❌ Ошибка Mob для ${orgLabel(org, org.id)}: ${e.message}`).catch(()=>{});
   }
 }
@@ -624,7 +624,7 @@ bot.onText(/\/status/, async (msg) => {
 - ${data.members.join('\n- ')}`;
     await sendMsg(msg.chat.id, txt, org);
   } catch (e) {
-    await sendMsg(msg.chat.id, 'Ошибка /status: ' + e.message, org);
+    if (ADMIN) await bot.sendMessage(ADMIN, `❌ Ошибка /status ${orgLabel(org, org.id)}: ${e.message}`).catch(()=>{});
   }
 });
 
@@ -644,7 +644,7 @@ bot.onText(/\/screens(?:\s+(\d+))?/, async (msg, m) => {
       await sendPhoto(msg.chat.id, path.join(dir, f), org, { caption: f });
     }
   } catch (e) {
-    await sendMsg(msg.chat.id, 'Ошибка чтения скринов: ' + e.message, org);
+    if (ADMIN) await bot.sendMessage(ADMIN, `❌ Ошибка скринов ${orgLabel(org, org.id)}: ${e.message}`).catch(()=>{});
   }
 });
 

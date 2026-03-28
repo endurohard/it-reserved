@@ -20,6 +20,7 @@ export async function launchBrowser() {
       '--disable-gpu',
       '--window-size=1440,900',
       '--lang=ru-RU,ru,en-US,en',
+      `--proxy-server=${process.env.HTTPS_PROXY || process.env.HTTP_PROXY || ''}`,
     ],
     slowMo
   });
