@@ -10,6 +10,13 @@ export async function launchBrowser() {
   const slowMo = Number(process.env.PUPPETEER_SLOWMO_MS || 0);
   const executablePath = process.env.PUPPETEER_EXECUTABLE_PATH || undefined;
 
+  // Чистим прокси перед запуском Puppeteer — vpbx.mts.ru ходит напрямую
+  const savedProxy = { HTTP_PROXY: process.env.HTTP_PROXY, HTTPS_PROXY: process.env.HTTPS_PROXY };
+  delete process.env.HTTP_PROXY;
+  delete process.env.HTTPS_PROXY;
+  delete process.env.http_proxy;
+  delete process.env.https_proxy;
+
   const browser = await puppeteer.launch({
     headless,
     executablePath,
@@ -36,6 +43,10 @@ export async function launchBrowser() {
   page.on('console', (msg) => {
     try { console.log('[page]', msg.type(), msg.text()); } catch {}
   });
+
+  // Восстанавливаем прокси для Telegram после запуска браузера
+  if (savedProxy.HTTP_PROXY) process.env.HTTP_PROXY = savedProxy.HTTP_PROXY;
+  if (savedProxy.HTTPS_PROXY) process.env.HTTPS_PROXY = savedProxy.HTTPS_PROXY;
 
   return { browser, page };
 }

@@ -12,7 +12,7 @@ services:
       - https_proxy=
       - NO_PROXY=localhost,127.0.0.1
       - no_proxy=localhost,127.0.0.1
-      - TG_SOCKS=socks5://127.0.0.1:1080
+      - TG_PROXY=http://127.0.0.1:1087
     restart: unless-stopped
     volumes:
       - ./bot/src:/app/src

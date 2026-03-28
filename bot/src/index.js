@@ -346,20 +346,19 @@ function scheduleMobTimer({ orgId, chatId, org }) {
 // Telegram bot
 
 console.log("[POLLING] Starting bot...");
-import { SocksProxyAgent } from 'socks-proxy-agent';
 
-const TG_SOCKS = process.env.TG_SOCKS || 'socks5://127.0.0.1:1080';
-let tgRequestOpts = {};
-if (TG_SOCKS) {
-  const socksAgent = new SocksProxyAgent(TG_SOCKS);
-  tgRequestOpts = { agent: socksAgent };
-  console.log('[TG] Using SOCKS proxy:', TG_SOCKS);
+// Прокси: ставим HTTP_PROXY для Telegram (@cypress/request подхватит автоматически)
+const TG_PROXY = process.env.TG_PROXY || '';
+if (TG_PROXY) {
+  process.env.HTTP_PROXY = TG_PROXY;
+  process.env.HTTPS_PROXY = TG_PROXY;
+  console.log('[TG] Set HTTP(S)_PROXY for Telegram polling:', TG_PROXY);
 }
 const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, {
-  polling: true,
-  request: tgRequestOpts,
+  polling: {
+    params: { timeout: 10 },  // короткий таймаут чтобы прокси не обрывал
+  },
 });
-
 
 // Обработка ошибок polling (ECONNRESET через прокси)
 let lastPollingError = 0;
