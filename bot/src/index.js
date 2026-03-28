@@ -17,8 +17,13 @@ const INTERESTING = new Set(['registered', 'unavailable']);
 const COOLDOWN_SEC = Number(process.env.SWITCH_COOLDOWN_SEC || 60);
 const GRACE_SEC    = Number(process.env.UNAVAILABLE_GRACE_SEC || 60); // ожидание после Unavailable
 
-// Последний известный применённый режим по организации
-const CURRENT_MODE = new Map(); // orgId -> 'SIP' | 'Mob'
+// Последний известный применённый режим по организации (backed by SQLite)
+const CURRENT_MODE = new Map(); // orgId -> 'SIP' | 'Mob' — загружается из БД при старте
+
+function setCurrentMode(orgId, mode) {
+  CURRENT_MODE.set(orgId, mode);
+  stmtUpsertMode.run({ org_id: orgId, mode, ts: Date.now() });
+}
 
 // ────────────────────────────────────────────────────────────
 // Утилиты
@@ -142,6 +147,11 @@ db.exec(`
     status  TEXT NOT NULL,
     ts      INTEGER NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS org_mode (
+    org_id  INTEGER PRIMARY KEY,
+    mode    TEXT NOT NULL,
+    ts      INTEGER NOT NULL
+  );
 `);
 
 const stmtUpsertExt = db.prepare(`
@@ -169,6 +179,12 @@ const stmtAllExts = db.prepare(`
 const stmtOrgExts = db.prepare(`
   SELECT ext, org_id, status, ts FROM ext_status WHERE org_id=? ORDER BY ext
 `);
+
+const stmtUpsertMode = db.prepare(`
+  INSERT INTO org_mode (org_id, mode, ts) VALUES (@org_id, @mode, @ts)
+  ON CONFLICT(org_id) DO UPDATE SET mode=excluded.mode, ts=excluded.ts
+`);
+const stmtGetModes = db.prepare(`SELECT org_id, mode, ts FROM org_mode`);
 
 // ────────────────────────────────────────────────────────────
 // EXT config из .env (новый формат + legacy)
@@ -233,6 +249,16 @@ db.transaction(() => {
     db.prepare(`DELETE FROM ext_status WHERE ext NOT IN (${placeholders})`).run(...allowed);
   }
 })();
+
+// Загрузка CURRENT_MODE из БД при старте
+try {
+  for (const row of stmtGetModes.all()) {
+    CURRENT_MODE.set(row.org_id, row.mode);
+  }
+  console.log('[MODE] loaded from DB:', Object.fromEntries(CURRENT_MODE));
+} catch (e) {
+  console.warn('[MODE] load error:', e.message);
+}
 
 // ────────────────────────────────────────────────────────────
 // Хелперы логики
@@ -304,7 +330,7 @@ function scheduleMobTimer({ orgId, chatId, org }) {
         return;
       }
       await withRetry(() => triggerModeForOrg('Mob', { chatId, org }), { label: orgLabel(org, orgId) + " Mob" });
-      CURRENT_MODE.set(orgId, 'Mob');
+      setCurrentMode(orgId, 'Mob');
     } catch (e) {
       console.error(`[TIMER] ORG${orgId}: ошибка Mob по таймеру:`, e.message);
     } finally {
@@ -320,13 +346,18 @@ function scheduleMobTimer({ orgId, chatId, org }) {
 // Telegram bot
 
 console.log("[POLLING] Starting bot...");
-const TG_PROXY = process.env.TG_PROXY || '';
-if (TG_PROXY) {
-  console.log('[TG] Using proxy:', TG_PROXY);
+import { SocksProxyAgent } from 'socks-proxy-agent';
+
+const TG_SOCKS = process.env.TG_SOCKS || 'socks5://127.0.0.1:1080';
+let tgRequestOpts = {};
+if (TG_SOCKS) {
+  const socksAgent = new SocksProxyAgent(TG_SOCKS);
+  tgRequestOpts = { agent: socksAgent };
+  console.log('[TG] Using SOCKS proxy:', TG_SOCKS);
 }
 const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, {
   polling: true,
-  request: TG_PROXY ? { proxy: TG_PROXY, tunnel: true } : {},
+  request: tgRequestOpts,
 });
 
 
@@ -334,9 +365,8 @@ const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, {
 let lastPollingError = 0;
 bot.on("polling_error", (err) => {
   const now = Date.now();
-  // Логируем не чаще раза в 60 секунд, чтобы не засорять логи
-  if (now - lastPollingError > 60000) {
-    console.warn("[POLLING] error:", err.code || err.message);
+  if (now - lastPollingError > 10000) {
+    console.warn("[POLLING] error:", err.code || err.message, err.message, err.stack?.split('\n').slice(0,3).join(' | '));
     lastPollingError = now;
   }
 });
@@ -537,7 +567,7 @@ app.post('/extension-status', async (req, res) => {
         return;
       }
       await withRetry(() => triggerModeForOrg('SIP', { chatId, org }), { label: orgLabel(org, orgId) + " SIP" });
-      CURRENT_MODE.set(orgId, 'SIP');
+      setCurrentMode(orgId, 'SIP');
       return;
     }
 
