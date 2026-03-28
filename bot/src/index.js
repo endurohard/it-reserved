@@ -6,7 +6,6 @@ import { MtsClient } from './mtsClient.js';
 import fs from 'fs';
 import path from 'node:path';
 import express from 'express';
-import { HttpsProxyAgent } from 'https-proxy-agent';
 import Database from 'better-sqlite3';
 
 // ────────────────────────────────────────────────────────────
@@ -321,14 +320,15 @@ function scheduleMobTimer({ orgId, chatId, org }) {
 // Telegram bot
 
 console.log("[POLLING] Starting bot...");
-const TG_PROXY = process.env.TG_PROXY || process.env.HTTPS_PROXY || process.env.HTTP_PROXY || '';
-const botOptions = { polling: true };
+const TG_PROXY = process.env.TG_PROXY || '';
 if (TG_PROXY) {
-  const agent = new HttpsProxyAgent(TG_PROXY);
-  botOptions.request = { agent };
   console.log('[TG] Using proxy:', TG_PROXY);
 }
-const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, botOptions);
+const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, {
+  polling: true,
+  request: TG_PROXY ? { proxy: TG_PROXY, tunnel: true } : {},
+});
+
 
 // Обработка ошибок polling (ECONNRESET через прокси)
 let lastPollingError = 0;
