@@ -303,7 +303,7 @@ function scheduleMobTimer({ orgId, chatId, org }) {
         console.log(`[TIMER] ORG${orgId}: cooldown — Mob не делаю`);
         return;
       }
-      await triggerModeForOrg('Mob', { chatId, org });
+      await withRetry(() => triggerModeForOrg('Mob', { chatId, org }), { label: orgLabel(org, orgId) + " Mob" });
       CURRENT_MODE.set(orgId, 'Mob');
     } catch (e) {
       console.error(`[TIMER] ORG${orgId}: ошибка Mob по таймеру:`, e.message);
@@ -319,7 +319,19 @@ function scheduleMobTimer({ orgId, chatId, org }) {
 // ────────────────────────────────────────────────────────────
 // Telegram bot
 
+console.log("[POLLING] Starting bot...");
 const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: true });
+
+// Обработка ошибок polling (ECONNRESET через прокси)
+let lastPollingError = 0;
+bot.on("polling_error", (err) => {
+  const now = Date.now();
+  // Логируем не чаще раза в 60 секунд, чтобы не засорять логи
+  if (now - lastPollingError > 60000) {
+    console.warn("[POLLING] error:", err.code || err.message);
+    lastPollingError = now;
+  }
+});
 const ADMIN = process.env.ADMIN_CHAT_ID ? Number(process.env.ADMIN_CHAT_ID) : null;
 
 // Хелперы: отправка сообщений/фото в указанную тему (если она настроена)
@@ -365,6 +377,20 @@ function onlyAdminOrGroup(msg) {
 
 // ────────────────────────────────────────────────────────────
 // Переключение режима для конкретной организации
+
+// Retry-обёртка: повторяет fn до maxRetries раз при сетевых ошибках
+async function withRetry(fn, { maxRetries = 2, delayMs = 3000, label = "" } = {}) {
+  for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const isNetErr = /ECONNRESET|ERR_CONNECTION_RESET|ETIMEDOUT|ECONNREFUSED|net::/i.test(err.message);
+      if (!isNetErr || attempt > maxRetries) throw err;
+      console.warn(`[RETRY] ${label} attempt ${attempt}/${maxRetries + 1} failed: ${err.message}. Retrying in ${delayMs}ms...`);
+      await new Promise(r => setTimeout(r, delayMs));
+    }
+  }
+}
 
 async function triggerModeForOrg(mode, { chatId, org }) {
   const { login, password, group_url } = org;
@@ -502,7 +528,7 @@ app.post('/extension-status', async (req, res) => {
         console.log(`⏱️ Cooldown SIP ${orgLabel(org, orgId)}`);
         return;
       }
-      await triggerModeForOrg('SIP', { chatId, org });
+      await withRetry(() => triggerModeForOrg('SIP', { chatId, org }), { label: orgLabel(org, orgId) + " SIP" });
       CURRENT_MODE.set(orgId, 'SIP');
       return;
     }
